@@ -4,12 +4,14 @@ import json
 import click
 import inspect
 import platform
+from typing import Any
 from openai import OpenAI
 from string import Template
 from dotenv import load_dotenv
-from typing import List, Callable, Tuple
+from typing import List, Callable
 
 from prompt_template import react_system_prompt_template
+from utils import generate_tool_schema
 
 LANGUAGE_CONFIGS = {}
 
@@ -201,6 +203,8 @@ class ReActAgent:
         max_steps: int = 15,
     ):
         self.tools = {func.__name__: func for func in tools}
+        self.tool_schemas: list[Any] = [generate_tool_schema(func) for func in tools]
+        # print(f"\ntool_schemas: {self.tool_schemas}")
         self.model = model
         self.max_steps = max_steps
         self.project_directory = project_directory
@@ -210,12 +214,12 @@ class ReActAgent:
         )
 
     def run(self, user_input: str):
-        messages = [
+        messages: list[Any] = [
             {
                 "role": "system",
                 "content": self.render_system_prompt(react_system_prompt_template),
             },
-            {"role": "user", "content": f"<question>{user_input}</question>"},
+            {"role": "user", "content": user_input},
         ]
 
         step_count = 0
@@ -224,76 +228,84 @@ class ReActAgent:
             step_count += 1
             print(f"\n⚡️ --- [当前执行步数：{step_count}/{self.max_steps}] ---")
 
+            print(f"\n messages size: {len(messages)}")
             if len(messages) > 10:
                 print("🧠 [记忆管理] 历史对话过长，已遗忘最早的一轮执行记录...")
                 messages.pop(2)
                 messages.pop(2)
 
-            # 请求模型
-            content = self.call_model(messages) or ""
+            print("\n正在思考并请求模型...")
 
-            # 检测 Thought
-            thought_match = re.search(r"<thought>(.*?)</thought>", content, re.DOTALL)
-            if thought_match:
-                thought = thought_match.group(1)
-                print(f"\n\n💭 Thought: {thought}")
-
-            # 检测模型是否输出 Final Answer，如果是的话，直接返回
-            if "<final_answer>" in content:
-                final_answer = re.search(
-                    r"<final_answer>(.*?)</final_answer>", content, re.DOTALL
-                )
-                if final_answer:
-                    return final_answer.group(1)
-
-            # 检测 Action
-            action_match = re.search(r"<action>(.*?)</action>", content, re.DOTALL)
-            if not action_match:
-                print(
-                    "\n⚠️ 警告：模型未按照规范输出 XML 标签，尝试将其原始回复作为最终答案提取。"
-                )
-
-                if thought_match:
-                    clean_content = content.replace(thought_match.group(0), "").strip()
-                    return clean_content if clean_content else content
-                return content
-
-            action = action_match.group(1)
-            tool_name, kwargs = self.parse_action(action)
-            # 只有终端命令才需要询问用户，其他的工具直接执行
-            should_continue = (
-                input("\n\n是否继续？（Y/N）")
-                if tool_name == "run_terminal_command"
-                else "y"
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                tools=self.tool_schemas,
+                tool_choice="auto",
+                stream=False,
             )
-            if should_continue.lower() != "y":
-                print("\n\n操作已取消。")
-                return "操作被用户取消"
+            response_message = response.choices[0].message
+            messages.append(response_message)
 
-            try:
-                print(f"tool_name: {tool_name}, args: {kwargs}")
-                raw_observation = str(self.tools[tool_name](**kwargs))
-                max_obs_length = 2000
-                observation = ""
+            if response_message.content:
+                print(f"\n💭 助手思考/回复: {response_message.content}")
 
-                if len(raw_observation) > max_obs_length:
-                    half = max_obs_length // 2
-                    observation = (
-                        raw_observation[:half]
-                        + f"\n\n...[中间内容过长被自动截断，省略了 {len(raw_observation) - max_obs_length} 字]...\n\n"
-                        + raw_observation[-half:]
-                    )
+            if response_message.tool_calls:
+                for tool_call in response_message.tool_calls:
+                    tool_name = tool_call.function.name
+                    try:
+                        tool_args = json.loads(tool_call.function.arguments)
+                    except json.JSONDecodeError as e:
+                        print(f"❌ 参数解析失败: {e}")
+                        tool_args = {}
+
+                    print(f"\n🛠️  模型请求调用工具: {tool_name}")
                     print(
-                        f"✂️ [记忆管理] 观察结果超长({len(raw_observation)}字)，已自动截断保留头尾。"
+                        f"📦 参数: {json.dumps(tool_args, indent=2, ensure_ascii=False)}"
                     )
-                else:
-                    observation = raw_observation
-            except Exception as e:
-                observation = f"工具执行错误：{str(e)}"
 
-            print(f"\n\n🔍 Observation：{observation}")
-            obs_msg = f"<observation>{observation}</observation>"
-            messages.append({"role": "user", "content": obs_msg})
+                    if tool_name == "run_terminal_command":
+                        should_continue = input("\n是否继续执行终端命令？（Y/N）: ")
+                        if should_continue.lower() != "y":
+                            print("\n\n操作已取消。")
+                            return "操作被用户取消"
+
+                    try:
+                        raw_observation = str(self.tools[tool_name](**tool_args))
+                        max_obs_length = 2000
+
+                        # 结果截断处理
+                        if len(raw_observation) > max_obs_length:
+                            half = max_obs_length // 2
+                            observation = (
+                                raw_observation[:half]
+                                + f"\n\n...[中间内容过长被自动截断，省略了 {len(raw_observation) - max_obs_length} 字]...\n\n"
+                                + raw_observation[-half:]
+                            )
+                            print(
+                                f"✂️ [记忆管理] 观察结果超长({len(raw_observation)}字)，已自动截断保留头尾。"
+                            )
+                        else:
+                            observation = raw_observation
+
+                    except Exception as e:
+                        observation = f"工具执行错误：{str(e)}"
+
+                    print(f"🔍 工具执行结果 (截断预览): {observation[:200]}...")
+
+                    # 按照原生 Tool 协议格式，将执行结果返回给模型
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": tool_name,
+                            "content": observation,
+                        }
+                    )
+                # 工具执行完毕，继续下一轮while循环让模型根据 observation 思考
+                continue
+
+            # 如果没有发起工具调用，说明任务完成或给出了最终解答
+            return response_message.content
 
         print(
             f"\n❌ 警告：Agent 达到了最大执行步数限制（{self.max_steps}步），已被强制终止以防止API余额枯竭。"
@@ -339,50 +351,13 @@ class ReActAgent:
             )
         return api_key
 
-    def call_model(self, messages):
-        print("\n\n正在请求模型，请稍等...")
-        response = self.client.chat.completions.create(
-            model=self.model, messages=messages, stream=True
-        )
-        content = ""
-        for chunk in response:
-            delta = chunk.choices[0].delta.content
-            if delta:
-                print(delta, end="", flush=True)
-                content += delta
-
-        print()
-
-        messages.append({"role": "assistant", "content": content})
-        return content
-
-    def parse_action(self, code_str: str) -> Tuple[str, dict]:
-        code_str = code_str.strip()
-
-        if code_str.startswith("```json"):
-            code_str = code_str[7:]
-        elif code_str.startswith("```"):
-            code_str = code_str[3:]
-        if code_str.endswith("```"):
-            code_str = code_str[:-3]
-
-        code_str = code_str.strip()
-
-        try:
-            action_obj = json.loads(code_str)
-            return action_obj["tool"], action_obj.get("args", {})
-        except json.JSONDecodeError as e:
-            raise ValueError(
-                f"Action 格式不是合法的 JSON，解析失败：{str(e)}\n原始内容：{code_str}"
-            )
-
     def get_operating_system_name(self):
         os_map = {"Darwin": "macOS", "Windows": "Windows", "Linux": "Linux"}
 
         return os_map.get(platform.system(), "Unknown")
 
 
-def read_file(file_path, start_line=1, end_line=None):
+def read_file(file_path: str, start_line: int = 1, end_line: int | None = None) -> str:
     """读取文件的指定行数内容，如果不指定end_line，默认读取整个文件。如果文件过大，请尝试分段读取。"""
     try:
         with open(file_path, "r", encoding="utf-8") as f:
@@ -403,7 +378,7 @@ def read_file(file_path, start_line=1, end_line=None):
         return f"读取失败：{str(e)}"
 
 
-def write_to_file(file_path, content):
+def write_to_file(file_path: str, content: str) -> str:
     """将指定内容写入指定文件"""
     print("file_path", file_path)
     with open(file_path, "w", encoding="utf-8") as f:
@@ -412,7 +387,11 @@ def write_to_file(file_path, content):
 
 
 def _process_node(
-    node, capture_name: str, ext: str, code_bytes: bytes, outline_items: list
+    node: Any,
+    capture_name: str,
+    ext: str,
+    code_bytes: bytes,
+    outline_items: list[tuple[int, str]],
 ):
     """辅助函数：处理单个 Tree-sitter 节点并将其添加到 outline_items"""
     line_num = node.start_point[0] + 1
@@ -451,7 +430,7 @@ def _process_node(
         outline_items.append((line_num, f"行 {line_num}: {node_type} {node_text}"))
 
 
-def get_outline_with_treesitter(file_path):
+def get_outline_with_treesitter(file_path: str):
     """获取代码文件的大纲（提取类、函数、接口等定义），帮助快速了解文件全貌。使用工业级 Tree-sitter解析。"""
     if not os.path.exists(file_path):
         return f"错误：文件{file_path} 不存在。"
@@ -491,14 +470,15 @@ def get_outline_with_treesitter(file_path):
 
             outline_items = []
             # 统一处理捕捉结果 (有些版本返回列表，有些返回字典)
-            if isinstance(matches_or_captures, dict):
-                # 如果是 { "capture_name": [node1, node2] } 格式
+            if hasattr(
+                matches_or_captures, "items"
+            ):  # 如果是 { "capture_name": [node1, node2] } 格式
                 for capture_name, nodes in matches_or_captures.items():
                     for node in nodes:
                         _process_node(
                             node, capture_name, ext, code_bytes, outline_items
                         )
-            elif isinstance(matches_or_captures, list):
+            else:
                 # 如果是 [(node, "capture_name"), ...] 格式 (较新版本的默认行为)
                 for item in matches_or_captures:
                     if len(item) == 2:
@@ -546,7 +526,7 @@ def get_outline_with_treesitter(file_path):
         return f"获取大纲失败: {str(e)}"
 
 
-def search_in_file_fuzzy(file_path, keywords):
+def search_in_file_fuzzy(file_path: str, keywords: list[str]) -> str:
     """
     在指定文件夹中搜索多个可能得关键词（传入列表）, 只要命中任意一个关键词就会返回该行及其上下文。
     这能大幅提高搜索命中率。例如 keywords=['login', 'auto', signin']
@@ -630,4 +610,3 @@ def main(project_directory):
 
 if __name__ == "__main__":
     main()
-
