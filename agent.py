@@ -4,11 +4,10 @@ import json
 import click
 import inspect
 import platform
-from typing import Any
-from openai import OpenAI
+from typing import Any, List, Callable, Tuple, Optional, TypedDict, Literal
+from openai import OpenAI, responses
 from string import Template
 from dotenv import load_dotenv
-from typing import List, Callable
 
 from prompt_template import react_system_prompt_template
 from utils import generate_tool_schema
@@ -194,6 +193,15 @@ except ImportError:
     print("⚠️ 未安装 Tree-sitter 相关包，大纲提取工具将降级使用正则模式。")
 
 
+# 全局状态（State）的数据结构
+# 所有的上下文、计数器和执行状态都集中在这里，节点只负责读取和更新这个状态
+class AgentState(TypedDict):
+    messages: list[Any]
+    step_count: int
+    status: Literal["running", "completed", "cancelled", "max_steps_reached", "error"]
+    final_answer: str
+
+
 class ReActAgent:
     def __init__(
         self,
@@ -213,104 +221,153 @@ class ReActAgent:
             api_key=ReActAgent.get_api_key(),
         )
 
-    def run(self, user_input: str):
-        messages: list[Any] = [
-            {
-                "role": "system",
-                "content": self.render_system_prompt(react_system_prompt_template),
-            },
-            {"role": "user", "content": user_input},
-        ]
+    # =============================
+    # 节点 1: 大模型思考节点（LLM Node）
+    # 负责读取当前状态，请求模型，并决定下一步去向
+    # =============================
+    def _node_llm(self, state: AgentState) -> str:
+        state["step_count"] += 1
+        print(f"\n⚡️ --- [当前执行步数：{state['step_count']}/{self.max_steps}] ---")
 
-        step_count = 0
+        # 记忆管理：剥离最旧的一轮工具交互，保留 System（0）和 User（1）
+        if len(state["messages"]) > 10:
+            print("🧠 [记忆管理] 历史对话过长，已遗忘最早的一轮执行记录...")
+            state["messages"].pop(2)
+            state["messages"].pop(2)
 
-        while step_count <= self.max_steps:
-            step_count += 1
-            print(f"\n⚡️ --- [当前执行步数：{step_count}/{self.max_steps}] ---")
-
-            print(f"\n messages size: {len(messages)}")
-            if len(messages) > 10:
-                print("🧠 [记忆管理] 历史对话过长，已遗忘最早的一轮执行记录...")
-                messages.pop(2)
-                messages.pop(2)
-
-            print("\n正在思考并请求模型...")
-
+        print("\n正在思考并请求模型...")
+        try:
             response = self.client.chat.completions.create(
                 model=self.model,
-                messages=messages,
+                messages=state["messages"],
                 tools=self.tool_schemas,
                 tool_choice="auto",
                 stream=False,
             )
             response_message = response.choices[0].message
-            messages.append(response_message)
+            state["messages"].append(response_message)
 
             if response_message.content:
                 print(f"\n💭 助手思考/回复: {response_message.content}")
 
+            # 路由决策：是否需要调用工具？
             if response_message.tool_calls:
-                for tool_call in response_message.tool_calls:
-                    tool_name = tool_call.function.name
-                    try:
-                        tool_args = json.loads(tool_call.function.arguments)
-                    except json.JSONDecodeError as e:
-                        print(f"❌ 参数解析失败: {e}")
-                        tool_args = {}
+                if state["step_count"] >= self.max_steps:
+                    state["status"] = "max_steps_reached"
+                    return "END"
+                return "tool_node"
+            else:
+                # 没有工具调用，说明给出了最终解答
+                state["status"] = "completed"
+                state["final_answer"] = response_message.content or "无文本输出"
+                return "END"
 
-                    print(f"\n🛠️  模型请求调用工具: {tool_name}")
+        except Exception as e:
+            print(f"❌ 模型请求失败: {e}")
+            state["status"] = "error"
+            state["final_answer"] = f"模型请求失败: {str(e)}"
+            return "END"
+
+    # =============================
+    # 节点 2: 工具执行节点（Tool Node）
+    # 负责解析大模型的工具请求，执行本地代码，并将结果写回状态
+    # =============================
+    def _node_tool(self, state: AgentState) -> str:
+        # 获取最新的一条消息（必定包含tool_calls）
+        last_message = state["messages"][-1]
+
+        for tool_call in last_message.tool_calls:
+            tool_name = tool_call.function.name
+            try:
+                tool_args = json.loads(tool_call.function.arguments)
+            except json.JSONDecodeError as e:
+                print(f"❌ 参数解析失败: {e}")
+                tool_args = {}
+
+            # 终端命令安全拦截
+            if tool_name == "run_terminal_command":
+                should_continue = input("\n是否继续执行终端命令？（Y/N）: ")
+                if should_continue.lower() != "y":
+                    print("\n\n操作已取消。")
+                    state["status"] = "cancelled"
+                    return "END"
+
+            # 执行工具
+            try:
+                raw_observation = str(self.tools[tool_name](**tool_args))
+                max_obs_length = 2000
+
+                # 结果截断处理
+                if len(raw_observation) > max_obs_length:
+                    half = max_obs_length // 2
+                    observation = (
+                        raw_observation[:half]
+                        + f"\n\n...[截断 {len(raw_observation) - max_obs_length} 字]...\n\n"
+                        + raw_observation[-half:]
+                    )
                     print(
-                        f"📦 参数: {json.dumps(tool_args, indent=2, ensure_ascii=False)}"
+                        f"✂️ [记忆管理] 观察结果超长({len(raw_observation)}字)，已自动截断保留头尾。"
                     )
+                else:
+                    observation = raw_observation
+            except Exception as e:
+                observation = f"工具执行错误：{str(e)}"
 
-                    if tool_name == "run_terminal_command":
-                        should_continue = input("\n是否继续执行终端命令？（Y/N）: ")
-                        if should_continue.lower() != "y":
-                            print("\n\n操作已取消。")
-                            return "操作被用户取消"
+            print(f"🔍 工具执行结果 (截断预览): {observation[:200]}...")
 
-                    try:
-                        raw_observation = str(self.tools[tool_name](**tool_args))
-                        max_obs_length = 2000
+            # 将执行结果存入状态
+            state["messages"].append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "name": tool_name,
+                    "content": observation,
+                }
+            )
 
-                        # 结果截断处理
-                        if len(raw_observation) > max_obs_length:
-                            half = max_obs_length // 2
-                            observation = (
-                                raw_observation[:half]
-                                + f"\n\n...[中间内容过长被自动截断，省略了 {len(raw_observation) - max_obs_length} 字]...\n\n"
-                                + raw_observation[-half:]
-                            )
-                            print(
-                                f"✂️ [记忆管理] 观察结果超长({len(raw_observation)}字)，已自动截断保留头尾。"
-                            )
-                        else:
-                            observation = raw_observation
+        # 工具执行完毕，必须回到大模型节点继续思考
+        return "llm_node"
 
-                    except Exception as e:
-                        observation = f"工具执行错误：{str(e)}"
+    # =============================
+    # 引擎主干：状态机执行图（State Graph Runner）
+    # =============================
+    def run(self, user_input: str):
+        state: AgentState = {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": self.render_system_prompt(react_system_prompt_template),
+                },
+                {"role": "user", "content": user_input},
+            ],
+            "step_count": 0,
+            "status": "running",
+            "final_answer": "",
+        }
 
-                    print(f"🔍 工具执行结果 (截断预览): {observation[:200]}...")
+        current_node = "llm_node"
 
-                    # 按照原生 Tool 协议格式，将执行结果返回给模型
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "name": tool_name,
-                            "content": observation,
-                        }
-                    )
-                # 工具执行完毕，继续下一轮while循环让模型根据 observation 思考
-                continue
+        # 状态机主循环：只负责路由流转，不处理具体业务逻辑
+        while state["status"] == "running":
+            if current_node == "llm_node":
+                current_node = self._node_llm(state)
+            elif current_node == "tool_node":
+                current_node = self._node_tool(state)
+            elif current_node == "END":
+                break
 
-            # 如果没有发起工具调用，说明任务完成或给出了最终解答
-            return response_message.content
-
-        print(
-            f"\n❌ 警告：Agent 达到了最大执行步数限制（{self.max_steps}步），已被强制终止以防止API余额枯竭。"
-        )
-        return "【系统终止】任务因超过最大步数限制而未完成"
+        # 根据最新状态返回结果
+        if state["status"] == "completed":
+            return state["final_answer"]
+        elif state["status"] == "cancelled":
+            return "操作被用户取消"
+        elif state["status"] == "max_steps_reached":
+            print(
+                f"\n❌ 警告：Agent 达到了最大执行步数限制（{self.max_steps}步），已被强制终止。"
+            )
+            return "【系统终止】任务因超过最大步数限制而未完成"
+        else:
+            return f"【系统终止】发生异常退出。状态: {state['status']}"
 
     def get_tool_list(self) -> str:
         """生成工具列表字符串，包含函数签名和简要说明"""
@@ -466,7 +523,6 @@ def get_outline_with_treesitter(file_path: str):
 
             cursor = QueryCursor(query)
             matches_or_captures = cursor.captures(tree.root_node)
-            print("matches_or_captures", matches_or_captures)
 
             outline_items = []
             # 统一处理捕捉结果 (有些版本返回列表，有些返回字典)
