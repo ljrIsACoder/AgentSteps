@@ -3,9 +3,10 @@ import re
 import json
 import click
 import inspect
+import tiktoken
 import platform
-from typing import Any, List, Callable, Tuple, Optional, TypedDict, Literal
-from openai import OpenAI, responses
+from typing import Any, List, Callable, TypedDict, Literal
+from openai import OpenAI
 from string import Template
 from dotenv import load_dotenv
 
@@ -209,17 +210,52 @@ class ReActAgent:
         model: str,
         project_directory: str,
         max_steps: int = 15,
+        max_context_token: int = 32000,
     ):
         self.tools = {func.__name__: func for func in tools}
         self.tool_schemas: list[Any] = [generate_tool_schema(func) for func in tools]
-        # print(f"\ntool_schemas: {self.tool_schemas}")
         self.model = model
         self.max_steps = max_steps
+        self.max_context_token = max_context_token
         self.project_directory = project_directory
         self.client = OpenAI(
             base_url="https://openrouter.ai/api/v1",
             api_key=ReActAgent.get_api_key(),
         )
+
+        # 初始化tonkenizer (使用OpenAI通用的cl100k_base 近似估算)
+        try:
+            self.encoding = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            self.encoding = None
+
+    def _count_tokens(self, text: str) -> int:
+        """粗略估算字符串的token数量"""
+        if not text:
+            return 0
+        if self.encoding:
+            return len(self.encoding.encode(text))
+
+        return len(text) // 2
+
+    def _calculate_message_tokens(self, messages: list[Any]) -> int:
+        """计算当前完整对话的token消耗"""
+        total = 0
+
+        for msg in messages:
+            if isinstance(msg, dict):
+                content = msg.get("content") or ""
+                # 如果有 tool_calls，也要把工具调用的参数算进去
+                if msg.get("tool_calls"):
+                    content += str(msg.get("tool_calls"))
+            else:
+                # 兼容SDK的Message对象
+                content = getattr(msg, "content", "") or ""
+                if getattr(msg, "tool_calls", None):
+                    content += str(msg.tool_calls)
+            total += self._count_tokens(str(content))
+
+        return total
 
     # =============================
     # 节点 1: 大模型思考节点（LLM Node）
@@ -229,11 +265,12 @@ class ReActAgent:
         state["step_count"] += 1
         print(f"\n⚡️ --- [当前执行步数：{state['step_count']}/{self.max_steps}] ---")
 
-        # 记忆管理：剥离最旧的一轮工具交互，保留 System（0）和 User（1）
-        if len(state["messages"]) > 10:
-            print("🧠 [记忆管理] 历史对话过长，已遗忘最早的一轮执行记录...")
-            state["messages"].pop(2)
-            state["messages"].pop(2)
+        # 【核心流转逻辑】每次请求前，检查Token是否超标
+        current_tokens = self._calculate_message_tokens(state["messages"])
+        print(f"📊 当前上下文预估 Token: {current_tokens} / {self.max_context_token}")
+
+        if current_tokens > self.max_context_token:
+            return "summarize_node"
 
         print("\n正在思考并请求模型...")
         try:
@@ -284,6 +321,8 @@ class ReActAgent:
                 print(f"❌ 参数解析失败: {e}")
                 tool_args = {}
 
+            print(f"工具执行中...\n tool_name: {tool_name} \n tool_args: {tool_args}")
+
             # 终端命令安全拦截
             if tool_name == "run_terminal_command":
                 should_continue = input("\n是否继续执行终端命令？（Y/N）: ")
@@ -328,6 +367,104 @@ class ReActAgent:
         # 工具执行完毕，必须回到大模型节点继续思考
         return "llm_node"
 
+    def _evict_old_tool_outputs(
+        self, messages: list[Any], preserve_recent_rounds: int = 3
+    ) -> int:
+        """
+        就地清空早期历史中 role="tool" 的冗长 content，保留最近的 N 轮完整交互。
+        返回释放后节省的大致 Token 数量。
+        """
+        # 每轮标准交互通常包含: Assistant(tool_call) + Tool(observation)
+        # 保留最近 preserve_recent_rounds 轮即大约保留最后 6~8 条记录
+        protect_tail_index = max(0, len(messages) - (preserve_recent_rounds * 2))
+        freed_chars = 0
+
+        for i in range(2, protect_tail_index):  # 跳过 System(0) 和 User(1)
+            msg = messages[i]
+            if isinstance(msg, dict) and msg.get("role") == "tool":
+                original_content = msg.get("content", "")
+                # 如果内容超过 150 字符，判定为可被淘汰的冗长历史数据
+                if len(original_content) > 150:
+                    freed_chars += len(original_content)
+                    msg["content"] = (
+                        f"[该工具执行历史数据已于前期使用完毕，为节约上下文已被自动回收。工具名: {msg.get('name')}]"
+                    )
+
+        return freed_chars // 2  # 粗略换算释放的 token
+
+    # =============================
+    # 节点 3: 摘要压缩节点
+    # =============================
+    def _node_compress_context(self, state: AgentState) -> str:
+        messages = state["messages"]
+        print("\n🧹 [上下文管理] 检测到 Token 水位逼近上限，启动优化程序...")
+
+        # 第一阶段：尝试轻量级工具输出驱逐（0 延迟、0 费用）
+        freed_tokens = self._evict_old_tool_outputs(messages, preserve_recent_rounds=3)
+        current_tokens = self._calculate_message_tokens(messages)
+        print(
+            f"🧹 [第一级·工具清理] 已回收约 {freed_tokens} Tokens，当前水位: {current_tokens}/{self.max_context_token}"
+        )
+
+        # 如果清理后 Token 已经降回安全水位（预留 20% 安全余量），直接返回，避免 LLM 摘要
+        if current_tokens < (self.max_context_token * 0.8):
+            print("✅ 上下文已恢复安全区间，跳过大模型摘要。")
+            return "llm_node"
+
+        # 保护机制：系统提示词（0）、用户提问（1）和最近的两轮交互（最新4条消息）不能被压缩
+        if len(messages) <= 6:
+            return "llm_node"
+
+        keep_front = 2
+        keep_back = 4
+        # 提取中间需要被压缩的冗长历史
+        history_to_compress = messages[keep_front:-keep_back]
+
+        # 拼接这些历史消息用于大模型阅读
+        history_text = ""
+        for m in history_to_compress:
+            role = m.get("role") if isinstance(m, dict) else getattr(m, "role", "")
+            content = (
+                m.get("content") if isinstance(m, dict) else getattr(m, "content", "")
+            )
+            history_text += f"[{role}]: {content}\n"
+
+        # 发起一次独立的大模型调用，让其自己总结自己
+        summary_prompt = (
+            "你是一个记忆压缩助手。请将以下代码Agent的执行历史总结为一段精炼的笔记。\n"
+            "要求：\n"
+            "1. 提取所有已明确的结论（如文件位置、函数名、已发现的错误等）。\n"
+            "2. 忽略具体的长代码返回，保留核心路径和行动目的。\n"
+            "3. 语气保持客观，如：'已在 auth.js 中定位到 login 函数，未发现验证码逻辑。'\n\n"
+            f"--- 历史记录 ---\n{history_text}"
+        )
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": summary_prompt}],
+                temperature=0.3,
+            )
+            summary = response.choices[0].message.content
+            if summary:
+                print(f"🧠 [记忆压缩完成] 摘要内容: {summary[:100]}...")
+
+            # 用总结后的单条消息，替换掉中间的冗长记录
+            compressed_message = {
+                "role": "system",
+                "content": f"📋 早期执行历史摘要:\n{summary}",
+            }
+
+            state["messages"] = (
+                messages[:keep_front] + [compressed_message] + messages[-keep_back:]
+            )
+
+        except Exception as e:
+            print(f"⚠️ 记忆压缩失败，跳过此次压缩: {e}")
+
+        # 压缩完毕，流转回LLM节点继续主线任务
+        return "llm_node"
+
     # =============================
     # 引擎主干：状态机执行图（State Graph Runner）
     # =============================
@@ -353,6 +490,8 @@ class ReActAgent:
                 current_node = self._node_llm(state)
             elif current_node == "tool_node":
                 current_node = self._node_tool(state)
+            elif current_node == "summarize_node":
+                current_node = self._node_compress_context(state)
             elif current_node == "END":
                 break
 
@@ -587,9 +726,6 @@ def search_in_file_fuzzy(file_path: str, keywords: list[str]) -> str:
     在指定文件夹中搜索多个可能得关键词（传入列表）, 只要命中任意一个关键词就会返回该行及其上下文。
     这能大幅提高搜索命中率。例如 keywords=['login', 'auto', signin']
     """
-    if not isinstance(keywords, list):
-        return "错误：keywords参数必须是一个列表，例如 ['login', 'auth']"
-
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
