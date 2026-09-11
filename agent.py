@@ -5,193 +5,16 @@ import click
 import inspect
 import tiktoken
 import platform
-from typing import Any, List, Callable, TypedDict, Literal
 from openai import OpenAI
 from string import Template
 from dotenv import load_dotenv
-
+from event_center import BaseCallbackHandler, CallbackManager, ConsoleCallbackHandler
 from prompt_template import react_system_prompt_template
+from typing import Any, List, Callable, TypedDict, Literal
+from tree_sitter import Parser, Language, Query, QueryCursor
+
 from utils import generate_tool_schema
-
-LANGUAGE_CONFIGS = {}
-
-try:
-    from tree_sitter import Parser, Language, Query, QueryCursor
-    import tree_sitter_python
-    import tree_sitter_javascript
-    import tree_sitter_typescript
-    import tree_sitter_html
-    import tree_sitter_css
-
-    # === 动态导入并注册 Tree-sitter 语言配置 ===
-    # 这里使用了字典映射，将文件后缀与对应的 Tree-sitter 语言包及 AST 查询语句解耦。
-    # 如果未来需要添加新语言 (如 Java, Go)，只需 `pip install tree-sitter-java` 并在这里添加一行配置即可，无需修改核心逻辑。
-    LANGUAGE_CONFIGS.update(
-        {
-            ".py": {
-                "language": lambda: tree_sitter_python.language(),
-                "query": """
-                (class_definition name: (identifier) @class_name)
-                (function_definition name: (identifier) @func_name)
-            """,
-            },
-            ".js": {
-                "language": lambda: tree_sitter_javascript.language(),
-                "query": """
-                (
-                (comment)* @doc
-                .
-                (method_definition
-                    name: (property_identifier) @name) @definition.method
-                (#not-eq? @name "constructor")
-                (#strip! @doc "^[\\s\\*/]+|^[\\s\\*/]$")
-                (#select-adjacent! @doc @definition.method)
-                )
-
-                (
-                (comment)* @doc
-                .
-                [
-                    (class
-                    name: (_) @name)
-                    (class_declaration
-                    name: (_) @name)
-                ] @definition.class
-                (#strip! @doc "^[\\s\\*/]+|^[\\s\\*/]$")
-                (#select-adjacent! @doc @definition.class)
-                )
-
-                (
-                (comment)* @doc
-                .
-                [
-                (function_expression
-                name: (identifier) @name)
-                (function_declaration
-                name: (identifier) @name)
-                (generator_function
-                name: (identifier) @name)
-                (generator_function_declaration
-                name: (identifier) @name)
-                ] @definition.function
-                (#strip! @doc "^[\\s\\*/]+|^[\\s\\*/]$")
-                (#select-adjacent! @doc @definition.function)
-                )
-
-                (
-                (comment)* @doc
-                .
-                (lexical_declaration
-                (variable_declarator
-                name: (identifier) @name
-                value: [(arrow_function) (function_expression)]) @definition.function)
-                (#strip! @doc "^[\\s\\*/]+|^[\\s\\*/]$")
-                (#select-adjacent! @doc @definition.function)
-                    )
-
-                (
-                (comment)* @doc
-                .
-                (variable_declaration
-                (variable_declarator
-                name: (identifier) @name
-                value: [(arrow_function) (function_expression)]) @definition.function)
-                (#strip! @doc "^[\\s\\*/]+|^[\\s\\*/]$")
-                (#select-adjacent! @doc @definition.function)
-                )
-
-                (assignment_expression
-                left: [
-                (identifier) @name
-                (member_expression
-                property: (property_identifier) @name)
-                ]
-                right: [(arrow_function) (function_expression)]
-                ) @definition.function
-
-                (pair
-                key: (property_identifier) @name
-                value: [(arrow_function) (function_expression)]) @definition.function
-
-                (
-                    (call_expression
-                    function: (identifier) @name) @reference.call
-                    (#not-match? @name "^(require)$")
-                )
-
-                (call_expression
-                function: (member_expression
-                property: (property_identifier) @name)
-                arguments: (_) @reference.call)
-
-                (new_expression
-                constructor: (_) @name) @reference.class
-
-                (export_statement value: (assignment_expression left: (identifier) @name right: ([
-                (number)
-                (string)
-                (identifier)
-                (undefined)
-                (null)
-                (new_expression)
-                (binary_expression)
-                (call_expression)
-                ]))) @definition.constant
-            """,
-            },
-            ".ts": {
-                "language": lambda: tree_sitter_typescript.language_typescript(),
-                "query": """
-                (class_declaration name: (identifier) @class_name)
-                (function_declaration name: (identifier) @func_name)
-                (method_definition name: (property_identifier) @method_name)
-                (interface_declaration name: (identifier) @interface_name)
-            """,
-            },
-            ".tsx": {
-                "language": lambda: tree_sitter_typescript.language_tsx(),
-                "query": """
-                (class_declaration name: (identifier) @class_name)
-                (function_declaration name: (identifier) @func_name)
-                (method_definition name: (property_identifier) @method_name)
-                (interface_declaration name: (identifier) @interface_name)
-            """,
-            },
-            ".html": {
-                "language": lambda: tree_sitter_html.language(),
-                "query": """
-                (element
-                  (start_tag
-                    (tag_name) @tag
-                    (attribute
-                      (attribute_name) @attr_name
-                      (#match? @attr_name "^(id|class)$")
-                      (quoted_attribute_value) @attr_value
-                    )?
-                  )
-                ) @element
-            """,
-            },
-            ".css": {
-                "language": lambda: tree_sitter_css.language(),
-                "query": """
-                (rule_set
-                    (selectors) @selector
-                )
-            """,
-            },
-        }
-    )
-    LANGUAGE_CONFIGS[".jsx"] = LANGUAGE_CONFIGS[".js"]
-
-    HAS_TREESITTER = True
-except ImportError:
-    Parser = None
-    Language = None
-    Query = None
-    QueryCursor = None
-    HAS_TREESITTER = False
-    print("⚠️ 未安装 Tree-sitter 相关包，大纲提取工具将降级使用正则模式。")
+from lanuage_config import LANGUAGE_CONFIGS
 
 
 # 全局状态（State）的数据结构
@@ -211,6 +34,7 @@ class ReActAgent:
         project_directory: str,
         max_steps: int = 15,
         max_context_token: int = 32000,
+        callbacks: list[BaseCallbackHandler] | None = None,
     ):
         self.tools = {func.__name__: func for func in tools}
         self.tool_schemas: list[Any] = [generate_tool_schema(func) for func in tools]
@@ -222,6 +46,7 @@ class ReActAgent:
             base_url="https://openrouter.ai/api/v1",
             api_key=ReActAgent.get_api_key(),
         )
+        self.callback_manager = CallbackManager(callbacks or [])
 
         # 初始化tonkenizer (使用OpenAI通用的cl100k_base 近似估算)
         try:
@@ -263,16 +88,19 @@ class ReActAgent:
     # =============================
     def _node_llm(self, state: AgentState) -> str:
         state["step_count"] += 1
-        print(f"\n⚡️ --- [当前执行步数：{state['step_count']}/{self.max_steps}] ---")
-
+        self.callback_manager.trigger(
+            "on_step_start", state["step_count"], self.max_steps
+        )
         # 【核心流转逻辑】每次请求前，检查Token是否超标
         current_tokens = self._calculate_message_tokens(state["messages"])
-        print(f"📊 当前上下文预估 Token: {current_tokens} / {self.max_context_token}")
+        self.callback_manager.trigger(
+            "on_memory_check", current_tokens, self.max_context_token
+        )
 
         if current_tokens > self.max_context_token:
             return "summarize_node"
 
-        print("\n正在思考并请求模型...")
+        self.callback_manager.trigger("on_llm_start")
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
@@ -285,7 +113,9 @@ class ReActAgent:
             state["messages"].append(response_message)
 
             if response_message.content:
-                print(f"\n💭 助手思考/回复: {response_message.content}")
+                self.callback_manager.trigger(
+                    "on_llm_thought", response_message.content
+                )
 
             # 路由决策：是否需要调用工具？
             if response_message.tool_calls:
@@ -300,7 +130,7 @@ class ReActAgent:
                 return "END"
 
         except Exception as e:
-            print(f"❌ 模型请求失败: {e}")
+            self.callback_manager.trigger("on_error", f"模型请求失败: {str(e)}")
             state["status"] = "error"
             state["final_answer"] = f"模型请求失败: {str(e)}"
             return "END"
@@ -317,11 +147,10 @@ class ReActAgent:
             tool_name = tool_call.function.name
             try:
                 tool_args = json.loads(tool_call.function.arguments)
-            except json.JSONDecodeError as e:
-                print(f"❌ 参数解析失败: {e}")
+            except json.JSONDecodeError:
                 tool_args = {}
 
-            print(f"工具执行中...\n tool_name: {tool_name} \n tool_args: {tool_args}")
+            self.callback_manager.trigger("on_tool_start", tool_name, tool_args)
 
             # 终端命令安全拦截
             if tool_name == "run_terminal_command":
@@ -344,15 +173,12 @@ class ReActAgent:
                         + f"\n\n...[截断 {len(raw_observation) - max_obs_length} 字]...\n\n"
                         + raw_observation[-half:]
                     )
-                    print(
-                        f"✂️ [记忆管理] 观察结果超长({len(raw_observation)}字)，已自动截断保留头尾。"
-                    )
                 else:
                     observation = raw_observation
             except Exception as e:
                 observation = f"工具执行错误：{str(e)}"
 
-            print(f"🔍 工具执行结果 (截断预览): {observation[:200]}...")
+            self.callback_manager.trigger("on_tool_end", tool_name, observation)
 
             # 将执行结果存入状态
             state["messages"].append(
@@ -397,18 +223,15 @@ class ReActAgent:
     # =============================
     def _node_compress_context(self, state: AgentState) -> str:
         messages = state["messages"]
-        print("\n🧹 [上下文管理] 检测到 Token 水位逼近上限，启动优化程序...")
 
         # 第一阶段：尝试轻量级工具输出驱逐（0 延迟、0 费用）
         freed_tokens = self._evict_old_tool_outputs(messages, preserve_recent_rounds=3)
+        if freed_tokens > 0:
+            self.callback_manager.trigger("on_memory_evict", freed_tokens)
         current_tokens = self._calculate_message_tokens(messages)
-        print(
-            f"🧹 [第一级·工具清理] 已回收约 {freed_tokens} Tokens，当前水位: {current_tokens}/{self.max_context_token}"
-        )
 
         # 如果清理后 Token 已经降回安全水位（预留 20% 安全余量），直接返回，避免 LLM 摘要
         if current_tokens < (self.max_context_token * 0.8):
-            print("✅ 上下文已恢复安全区间，跳过大模型摘要。")
             return "llm_node"
 
         # 保护机制：系统提示词（0）、用户提问（1）和最近的两轮交互（最新4条消息）不能被压缩
@@ -447,8 +270,7 @@ class ReActAgent:
             )
             summary = response.choices[0].message.content
             if summary:
-                print(f"🧠 [记忆压缩完成] 摘要内容: {summary[:100]}...")
-
+                self.callback_manager.trigger("on_memory_summarize", summary)
             # 用总结后的单条消息，替换掉中间的冗长记录
             compressed_message = {
                 "role": "system",
@@ -460,7 +282,7 @@ class ReActAgent:
             )
 
         except Exception as e:
-            print(f"⚠️ 记忆压缩失败，跳过此次压缩: {e}")
+            self.callback_manager.trigger("on_error", f"摘要节点执行异常: {e}")
 
         # 压缩完毕，流转回LLM节点继续主线任务
         return "llm_node"
@@ -497,15 +319,20 @@ class ReActAgent:
 
         # 根据最新状态返回结果
         if state["status"] == "completed":
+            self.callback_manager.trigger("on_agent_finish", state["final_answer"])
             return state["final_answer"]
         elif state["status"] == "cancelled":
+            self.callback_manager.trigger("on_error", "操作被用户取消")
             return "操作被用户取消"
         elif state["status"] == "max_steps_reached":
-            print(
-                f"\n❌ 警告：Agent 达到了最大执行步数限制（{self.max_steps}步），已被强制终止。"
+            self.callback_manager.trigger(
+                "on_error", "系统终止：任务因超过最大步数限制而未完成"
             )
             return "【系统终止】任务因超过最大步数限制而未完成"
         else:
+            self.callback_manager.trigger(
+                "on_error", f"异常退出。状态: {state['status']}"
+            )
             return f"【系统终止】发生异常退出。状态: {state['status']}"
 
     def get_tool_list(self) -> str:
@@ -633,14 +460,7 @@ def get_outline_with_treesitter(file_path: str):
 
     ext = os.path.splitext(file_path)[1].lower()
 
-    if (
-        HAS_TREESITTER
-        and Parser
-        and Language
-        and Query
-        and QueryCursor
-        and ext in LANGUAGE_CONFIGS
-    ):
+    if Parser and Language and Query and QueryCursor and ext in LANGUAGE_CONFIGS:
         try:
             config = LANGUAGE_CONFIGS[ext]
             raw_lang = config["language"]()
@@ -786,11 +606,14 @@ def main(project_directory):
         get_outline_with_treesitter,
         search_in_file_fuzzy,
     ]
+
+    console_hanlder = ConsoleCallbackHandler()
     agent = ReActAgent(
         tools=tools,
-        model="deepseek/deepseek-v4-pro-0813",
+        model="deepseek/deepseek-v4.1-flash",
         project_directory=project_dir,
         max_steps=30,
+        callbacks=[console_hanlder],
     )
 
     task = input("请输入任务：")

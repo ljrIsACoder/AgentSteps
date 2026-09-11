@@ -8,10 +8,6 @@ def generate_tool_schema(func) -> dict:
     sig = inspect.signature(func)
     doc = inspect.getdoc(func) or ""
 
-    # print(f"sig: {sig} \n parameters: {sig.parameters.items()} \n doc: {doc}")
-
-    # print("\n ============")
-
     description = doc.split("\n\n")[0].strip()
 
     type_map = {
