@@ -9,13 +9,14 @@ from openai import OpenAI
 from string import Template
 from dotenv import load_dotenv
 from prompt_toolkit import prompt
-from event_center import BaseCallbackHandler, CallbackManager, ConsoleCallbackHandler
+from pydantic import BaseModel, Field
 from prompt_template import react_system_prompt_template
-from typing import Any, List, Callable, Optional, TypedDict, Literal
 from tree_sitter import Parser, Language, Query, QueryCursor
+from typing import Any, List, Callable, Optional, TypedDict, Literal
+from event_center import BaseCallbackHandler, CallbackManager, ConsoleCallbackHandler
 
-from utils import generate_tool_schema
 from lanuage_config import LANGUAGE_CONFIGS
+from utils import generate_tool_schema, tool
 
 
 # ==========================================
@@ -431,6 +432,15 @@ class ReActAgent:
         return os_map.get(platform.system(), "Unknown")
 
 
+class ReadFileArgs(BaseModel):
+    file_path: str = Field(..., description="要读取的文件的绝对路径")
+    start_line: int = Field(1, description="读取的起始行号，默认为1")
+    end_line: int | None = Field(
+        None, description="读取的结束行号，如果不指定则读取到文件末尾"
+    )
+
+
+@tool(args_schema=ReadFileArgs)
 def read_file(file_path: str, start_line: int = 1, end_line: int | None = None) -> str:
     """读取文件的指定行数内容，如果不指定end_line，默认读取整个文件。如果文件过大，请尝试分段读取。"""
     try:
@@ -452,6 +462,12 @@ def read_file(file_path: str, start_line: int = 1, end_line: int | None = None) 
         return f"读取失败：{str(e)}"
 
 
+class WriteToFileArgs(BaseModel):
+    file_path: str = Field(..., description="要写入文件的绝对路径")
+    content: str = Field(..., description="要写入文件的完整文件内容")
+
+
+@tool(args_schema=WriteToFileArgs)
 def write_to_file(file_path: str, content: str) -> str:
     """将指定内容写入指定文件"""
     print("file_path", file_path)
@@ -504,6 +520,11 @@ def _process_node(
         outline_items.append((line_num, f"行 {line_num}: {node_type} {node_text}"))
 
 
+class GetOutlineArgs(BaseModel):
+    file_path: str = Field(..., description="目标代码文件的绝对路径")
+
+
+@tool(args_schema=GetOutlineArgs)
 def get_outline_with_treesitter(file_path: str):
     """获取代码文件的大纲（提取类、函数、接口等定义），帮助快速了解文件全貌。使用工业级 Tree-sitter解析。"""
     if not os.path.exists(file_path):
@@ -592,10 +613,18 @@ def get_outline_with_treesitter(file_path: str):
         return f"获取大纲失败: {str(e)}"
 
 
+class SearchFuzzyArgs(BaseModel):
+    file_path: str = Field(..., description="要搜索文件的绝对路径")
+    keywords: list[str] = Field(
+        ..., description="要搜索的关键词列表，例如['login', 'auth']"
+    )
+
+
+@tool(args_schema=SearchFuzzyArgs)
 def search_in_file_fuzzy(file_path: str, keywords: list[str]) -> str:
     """
     在指定文件夹中搜索多个可能得关键词（传入列表）, 只要命中任意一个关键词就会返回该行及其上下文。
-    这能大幅提高搜索命中率。例如 keywords=['login', 'auto', signin']
+    这能大幅提高搜索命中率。例如 keywords=['login', 'auth', signin']
     """
     try:
         with open(file_path, "r", encoding="utf-8") as f:
@@ -627,7 +656,12 @@ def search_in_file_fuzzy(file_path: str, keywords: list[str]) -> str:
         return f"搜索失败：{str(e)}"
 
 
-def run_terminal_command(command):
+class RunTerminalArgs(BaseModel):
+    command: str = Field(..., description="要执行的有效终端/Shell命令")
+
+
+@tool(args_schema=RunTerminalArgs)
+def run_terminal_command(command: str) -> str:
     """用于执行终端命令"""
     import subprocess
 
