@@ -8,6 +8,7 @@ dependencies = [
     "click>=8.2.1",
     "httpx[socks]>=0.28.1",
     "openai>=1.91.0",
+    "prompt-toolkit>=3.0.53",
     "python-dotenv>=1.1.1",
     "tiktoken>=0.14.0",
     "tree-sitter>=0.26.0",

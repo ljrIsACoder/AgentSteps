@@ -8,19 +8,54 @@ import platform
 from openai import OpenAI
 from string import Template
 from dotenv import load_dotenv
+from prompt_toolkit import prompt
 from event_center import BaseCallbackHandler, CallbackManager, ConsoleCallbackHandler
 from prompt_template import react_system_prompt_template
-from typing import Any, List, Callable, TypedDict, Literal
+from typing import Any, List, Callable, Optional, TypedDict, Literal
 from tree_sitter import Parser, Language, Query, QueryCursor
 
 from utils import generate_tool_schema
 from lanuage_config import LANGUAGE_CONFIGS
 
 
+# ==========================================
+# 新增模块：标准消息对象体系 (Message Objects)
+# ==========================================
+class BaseMessage:
+    """所有消息的抽象基类"""
+
+    def __init__(self, content: str, role: str):
+        self.content = content
+        self.role = role
+
+
+class SystemMessage(BaseMessage):
+    def __init__(self, content: str):
+        super().__init__(content=content, role="system")
+
+
+class HumanMessage(BaseMessage):
+    def __init__(self, content: str):
+        super().__init__(content=content, role="user")
+
+
+class AIMessage(BaseMessage):
+    def __init__(self, content: str, tool_calls: Optional[list[dict]] = None):
+        super().__init__(content=content or "", role="assistant")
+        self.tool_calls = tool_calls or []
+
+
+class ToolMessage(BaseMessage):
+    def __init__(self, content: str, tool_call_id: str, name: str):
+        super().__init__(content=content, role="tool")
+        self.tool_call_id = tool_call_id
+        self.name = name
+
+
 # 全局状态（State）的数据结构
 # 所有的上下文、计数器和执行状态都集中在这里，节点只负责读取和更新这个状态
 class AgentState(TypedDict):
-    messages: list[Any]
+    messages: list[BaseMessage]
     step_count: int
     status: Literal["running", "completed", "cancelled", "max_steps_reached", "error"]
     final_answer: str
@@ -63,24 +98,34 @@ class ReActAgent:
 
         return len(text) // 2
 
-    def _calculate_message_tokens(self, messages: list[Any]) -> int:
+    def _calculate_message_tokens(self, messages: list[BaseMessage]) -> int:
         """计算当前完整对话的token消耗"""
         total = 0
 
         for msg in messages:
-            if isinstance(msg, dict):
-                content = msg.get("content") or ""
-                # 如果有 tool_calls，也要把工具调用的参数算进去
-                if msg.get("tool_calls"):
-                    content += str(msg.get("tool_calls"))
-            else:
-                # 兼容SDK的Message对象
-                content = getattr(msg, "content", "") or ""
-                if getattr(msg, "tool_calls", None):
-                    content += str(msg.tool_calls)
-            total += self._count_tokens(str(content))
+            content = msg.content
+            if isinstance(msg, AIMessage) and msg.tool_calls:
+                content += str(msg.tool_calls)
 
+            total += self._count_tokens(content)
         return total
+
+    # ==========================================
+    # 消息适配器：负责内部标准消息与外部 API 格式的转换
+    # ==========================================
+    def _format_messages_for_llm(self, messages: list[BaseMessage]) -> list[Any]:
+        """将内部对象转化为OpenAI需要的字典格式"""
+        formatted = []
+        for msg in messages:
+            msg_dict: dict[str, Any] = {"role": msg.role, "content": msg.content}
+            if isinstance(msg, AIMessage) and msg.tool_calls:
+                msg_dict["tool_calls"] = msg.tool_calls
+            elif isinstance(msg, ToolMessage):
+                msg_dict["tool_call_id"] = msg.tool_call_id
+                msg_dict["name"] = msg.name
+            formatted.append(msg_dict)
+
+        return formatted
 
     # =============================
     # 节点 1: 大模型思考节点（LLM Node）
@@ -102,23 +147,41 @@ class ReActAgent:
 
         self.callback_manager.trigger("on_llm_start")
         try:
+            api_message = self._format_messages_for_llm(state["messages"])
             response = self.client.chat.completions.create(
                 model=self.model,
-                messages=state["messages"],
+                messages=api_message,
                 tools=self.tool_schemas,
                 tool_choice="auto",
                 stream=False,
             )
             response_message = response.choices[0].message
-            state["messages"].append(response_message)
 
-            if response_message.content:
-                self.callback_manager.trigger(
-                    "on_llm_thought", response_message.content
-                )
+            # 将OpenAI返回的原始对象转换为标准的AIMessage对象
+            parsed_tool_calls = []
+            if response_message.tool_calls:
+                parsed_tool_calls = [
+                    {
+                        "id": tc.id,
+                        "type": tc.type,
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in response_message.tool_calls
+                ]
+
+            ai_msg = AIMessage(
+                content=response_message.content or "", tool_calls=parsed_tool_calls
+            )
+            state["messages"].append(ai_msg)
+
+            if ai_msg.content:
+                self.callback_manager.trigger("on_llm_thought", ai_msg.content)
 
             # 路由决策：是否需要调用工具？
-            if response_message.tool_calls:
+            if ai_msg.tool_calls:
                 if state["step_count"] >= self.max_steps:
                     state["status"] = "max_steps_reached"
                     return "END"
@@ -126,7 +189,7 @@ class ReActAgent:
             else:
                 # 没有工具调用，说明给出了最终解答
                 state["status"] = "completed"
-                state["final_answer"] = response_message.content or "无文本输出"
+                state["final_answer"] = ai_msg.content or "无文本输出"
                 return "END"
 
         except Exception as e:
@@ -143,10 +206,10 @@ class ReActAgent:
         # 获取最新的一条消息（必定包含tool_calls）
         last_message = state["messages"][-1]
 
-        for tool_call in last_message.tool_calls:
-            tool_name = tool_call.function.name
+        for tool_call in getattr(last_message, "tool_calls", []):
+            tool_name = tool_call["function"]["name"]
             try:
-                tool_args = json.loads(tool_call.function.arguments)
+                tool_args = json.loads(tool_call["function"]["arguments"])
             except json.JSONDecodeError:
                 tool_args = {}
 
@@ -154,7 +217,7 @@ class ReActAgent:
 
             # 终端命令安全拦截
             if tool_name == "run_terminal_command":
-                should_continue = input("\n是否继续执行终端命令？（Y/N）: ")
+                should_continue = prompt("\n是否继续执行终端命令？（Y/N）: ")
                 if should_continue.lower() != "y":
                     print("\n\n操作已取消。")
                     state["status"] = "cancelled"
@@ -182,12 +245,9 @@ class ReActAgent:
 
             # 将执行结果存入状态
             state["messages"].append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "name": tool_name,
-                    "content": observation,
-                }
+                ToolMessage(
+                    content=observation, tool_call_id=tool_call["id"], name=tool_name
+                )
             )
 
         # 工具执行完毕，必须回到大模型节点继续思考
@@ -207,14 +267,11 @@ class ReActAgent:
 
         for i in range(2, protect_tail_index):  # 跳过 System(0) 和 User(1)
             msg = messages[i]
-            if isinstance(msg, dict) and msg.get("role") == "tool":
-                original_content = msg.get("content", "")
+            if isinstance(msg, ToolMessage):
                 # 如果内容超过 150 字符，判定为可被淘汰的冗长历史数据
-                if len(original_content) > 150:
-                    freed_chars += len(original_content)
-                    msg["content"] = (
-                        f"[该工具执行历史数据已于前期使用完毕，为节约上下文已被自动回收。工具名: {msg.get('name')}]"
-                    )
+                if len(msg.content) > 150:
+                    freed_chars += len(msg.content)
+                    msg.content = f"[该工具执行历史数据已于前期使用完毕，为节约上下文已被自动回收。工具名: {msg.name}"
 
         return freed_chars // 2  # 粗略换算释放的 token
 
@@ -244,13 +301,9 @@ class ReActAgent:
         history_to_compress = messages[keep_front:-keep_back]
 
         # 拼接这些历史消息用于大模型阅读
-        history_text = ""
-        for m in history_to_compress:
-            role = m.get("role") if isinstance(m, dict) else getattr(m, "role", "")
-            content = (
-                m.get("content") if isinstance(m, dict) else getattr(m, "content", "")
-            )
-            history_text += f"[{role}]: {content}\n"
+        history_text = "".join(
+            [f"[{m.role}]: {m.content}\n" for m in history_to_compress]
+        )
 
         # 发起一次独立的大模型调用，让其自己总结自己
         summary_prompt = (
@@ -272,10 +325,9 @@ class ReActAgent:
             if summary:
                 self.callback_manager.trigger("on_memory_summarize", summary)
             # 用总结后的单条消息，替换掉中间的冗长记录
-            compressed_message = {
-                "role": "system",
-                "content": f"📋 早期执行历史摘要:\n{summary}",
-            }
+            compressed_message = SystemMessage(
+                content=f"📋 早期执行历史摘要:\n{summary}"
+            )
 
             state["messages"] = (
                 messages[:keep_front] + [compressed_message] + messages[-keep_back:]
@@ -293,11 +345,10 @@ class ReActAgent:
     def run(self, user_input: str):
         state: AgentState = {
             "messages": [
-                {
-                    "role": "system",
-                    "content": self.render_system_prompt(react_system_prompt_template),
-                },
-                {"role": "user", "content": user_input},
+                SystemMessage(
+                    content=self.render_system_prompt(react_system_prompt_template)
+                ),
+                HumanMessage(content=user_input),
             ],
             "step_count": 0,
             "status": "running",
@@ -591,7 +642,7 @@ def run_terminal_command(command):
 def main(project_directory):
     project_dir = os.path.abspath(project_directory)
     if not os.path.exists(project_dir):
-        should_create = input(f"目录 '{project_dir}' 不存在，是否创建？（Y/N): ")
+        should_create = prompt(f"目录 '{project_dir}' 不存在，是否创建？（Y/N): ")
         if should_create.lower() == "y":
             os.makedirs(project_dir)
             print(f"✅ 成功创建目录: {project_dir}")
@@ -616,7 +667,7 @@ def main(project_directory):
         callbacks=[console_hanlder],
     )
 
-    task = input("请输入任务：")
+    task = prompt("请输入任务：")
 
     final_answer = agent.run(task)
 
