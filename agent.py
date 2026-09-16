@@ -5,52 +5,19 @@ import click
 import inspect
 import tiktoken
 import platform
-from openai import OpenAI
 from string import Template
 from dotenv import load_dotenv
 from prompt_toolkit import prompt
 from pydantic import BaseModel, Field
+from llm import BaseChatModel, ChatOpenAI
 from prompt_template import react_system_prompt_template
 from tree_sitter import Parser, Language, Query, QueryCursor
-from typing import Any, List, Callable, Optional, TypedDict, Literal
+from typing import Any, List, Callable, TypedDict, Literal
 from event_center import BaseCallbackHandler, CallbackManager, ConsoleCallbackHandler
 
 from lanuage_config import LANGUAGE_CONFIGS
 from utils import generate_tool_schema, tool
-
-
-# ==========================================
-# 新增模块：标准消息对象体系 (Message Objects)
-# ==========================================
-class BaseMessage:
-    """所有消息的抽象基类"""
-
-    def __init__(self, content: str, role: str):
-        self.content = content
-        self.role = role
-
-
-class SystemMessage(BaseMessage):
-    def __init__(self, content: str):
-        super().__init__(content=content, role="system")
-
-
-class HumanMessage(BaseMessage):
-    def __init__(self, content: str):
-        super().__init__(content=content, role="user")
-
-
-class AIMessage(BaseMessage):
-    def __init__(self, content: str, tool_calls: Optional[list[dict]] = None):
-        super().__init__(content=content or "", role="assistant")
-        self.tool_calls = tool_calls or []
-
-
-class ToolMessage(BaseMessage):
-    def __init__(self, content: str, tool_call_id: str, name: str):
-        super().__init__(content=content, role="tool")
-        self.tool_call_id = tool_call_id
-        self.name = name
+from message import BaseMessage, AIMessage, ToolMessage, SystemMessage, HumanMessage
 
 
 # 全局状态（State）的数据结构
@@ -65,23 +32,19 @@ class AgentState(TypedDict):
 class ReActAgent:
     def __init__(
         self,
+        llm: BaseChatModel,
         tools: List[Callable],
-        model: str,
         project_directory: str,
         max_steps: int = 15,
         max_context_token: int = 32000,
         callbacks: list[BaseCallbackHandler] | None = None,
     ):
+        self.llm = llm
         self.tools = {func.__name__: func for func in tools}
         self.tool_schemas: list[Any] = [generate_tool_schema(func) for func in tools]
-        self.model = model
         self.max_steps = max_steps
         self.max_context_token = max_context_token
         self.project_directory = project_directory
-        self.client = OpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=ReActAgent.get_api_key(),
-        )
         self.callback_manager = CallbackManager(callbacks or [])
 
         # 初始化tonkenizer (使用OpenAI通用的cl100k_base 近似估算)
@@ -111,23 +74,6 @@ class ReActAgent:
             total += self._count_tokens(content)
         return total
 
-    # ==========================================
-    # 消息适配器：负责内部标准消息与外部 API 格式的转换
-    # ==========================================
-    def _format_messages_for_llm(self, messages: list[BaseMessage]) -> list[Any]:
-        """将内部对象转化为OpenAI需要的字典格式"""
-        formatted = []
-        for msg in messages:
-            msg_dict: dict[str, Any] = {"role": msg.role, "content": msg.content}
-            if isinstance(msg, AIMessage) and msg.tool_calls:
-                msg_dict["tool_calls"] = msg.tool_calls
-            elif isinstance(msg, ToolMessage):
-                msg_dict["tool_call_id"] = msg.tool_call_id
-                msg_dict["name"] = msg.name
-            formatted.append(msg_dict)
-
-        return formatted
-
     # =============================
     # 节点 1: 大模型思考节点（LLM Node）
     # 负责读取当前状态，请求模型，并决定下一步去向
@@ -148,34 +94,10 @@ class ReActAgent:
 
         self.callback_manager.trigger("on_llm_start")
         try:
-            api_message = self._format_messages_for_llm(state["messages"])
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=api_message,
-                tools=self.tool_schemas,
-                tool_choice="auto",
-                stream=False,
+            ai_msg = self.llm.invoke(
+                messages=state["messages"], tools=self.tool_schemas
             )
-            response_message = response.choices[0].message
 
-            # 将OpenAI返回的原始对象转换为标准的AIMessage对象
-            parsed_tool_calls = []
-            if response_message.tool_calls:
-                parsed_tool_calls = [
-                    {
-                        "id": tc.id,
-                        "type": tc.type,
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
-                        },
-                    }
-                    for tc in response_message.tool_calls
-                ]
-
-            ai_msg = AIMessage(
-                content=response_message.content or "", tool_calls=parsed_tool_calls
-            )
             state["messages"].append(ai_msg)
 
             if ai_msg.content:
@@ -317,12 +239,11 @@ class ReActAgent:
         )
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": summary_prompt}],
-                temperature=0.3,
-            )
-            summary = response.choices[0].message.content
+            summary_msg = HumanMessage(content=summary_prompt)
+            ai_msg = self.llm.invoke(messages=[summary_msg])
+
+            summary = ai_msg.content
+
             if summary:
                 self.callback_manager.trigger("on_memory_summarize", summary)
             # 用总结后的单条消息，替换掉中间的冗长记录
@@ -684,6 +605,12 @@ def main(project_directory):
             print("❌ 操作已取消，请提供一个存在的目录。")
             return
 
+    llm = ChatOpenAI(
+        model_name="deepseek/deepseek-v4.1-flash",
+        api_key=ReActAgent.get_api_key(),
+        base_url="https://openrouter.ai/api/v1",
+    )
+
     tools = [
         read_file,
         write_to_file,
@@ -693,9 +620,10 @@ def main(project_directory):
     ]
 
     console_hanlder = ConsoleCallbackHandler()
+
     agent = ReActAgent(
+        llm=llm,
         tools=tools,
-        model="deepseek/deepseek-v4.1-flash",
         project_directory=project_dir,
         max_steps=30,
         callbacks=[console_hanlder],
