@@ -78,19 +78,11 @@ class ReActAgent:
     # 节点 1: 大模型思考节点（LLM Node）
     # 负责读取当前状态，请求模型，并决定下一步去向
     # =============================
-    def _node_llm(self, state: AgentState) -> str:
+    def _node_llm(self, state: AgentState) -> None:
         state["step_count"] += 1
         self.callback_manager.trigger(
             "on_step_start", state["step_count"], self.max_steps
         )
-        # 【核心流转逻辑】每次请求前，检查Token是否超标
-        current_tokens = self._calculate_message_tokens(state["messages"])
-        self.callback_manager.trigger(
-            "on_memory_check", current_tokens, self.max_context_token
-        )
-
-        if current_tokens > self.max_context_token:
-            return "summarize_node"
 
         self.callback_manager.trigger("on_llm_start")
         try:
@@ -103,29 +95,16 @@ class ReActAgent:
             if ai_msg.content:
                 self.callback_manager.trigger("on_llm_thought", ai_msg.content)
 
-            # 路由决策：是否需要调用工具？
-            if ai_msg.tool_calls:
-                if state["step_count"] >= self.max_steps:
-                    state["status"] = "max_steps_reached"
-                    return "END"
-                return "tool_node"
-            else:
-                # 没有工具调用，说明给出了最终解答
-                state["status"] = "completed"
-                state["final_answer"] = ai_msg.content or "无文本输出"
-                return "END"
-
         except Exception as e:
             self.callback_manager.trigger("on_error", f"模型请求失败: {str(e)}")
             state["status"] = "error"
             state["final_answer"] = f"模型请求失败: {str(e)}"
-            return "END"
 
     # =============================
     # 节点 2: 工具执行节点（Tool Node）
     # 负责解析大模型的工具请求，执行本地代码，并将结果写回状态
     # =============================
-    def _node_tool(self, state: AgentState) -> str:
+    def _node_tool(self, state: AgentState) -> None:
         # 获取最新的一条消息（必定包含tool_calls）
         last_message = state["messages"][-1]
 
@@ -144,7 +123,7 @@ class ReActAgent:
                 if should_continue.lower() != "y":
                     print("\n\n操作已取消。")
                     state["status"] = "cancelled"
-                    return "END"
+                    return
 
             # 执行工具
             try:
@@ -173,9 +152,6 @@ class ReActAgent:
                 )
             )
 
-        # 工具执行完毕，必须回到大模型节点继续思考
-        return "llm_node"
-
     def _evict_old_tool_outputs(
         self, messages: list[Any], preserve_recent_rounds: int = 3
     ) -> int:
@@ -201,7 +177,7 @@ class ReActAgent:
     # =============================
     # 节点 3: 摘要压缩节点
     # =============================
-    def _node_compress_context(self, state: AgentState) -> str:
+    def _node_compress_context(self, state: AgentState) -> None:
         messages = state["messages"]
 
         # 第一阶段：尝试轻量级工具输出驱逐（0 延迟、0 费用）
@@ -212,11 +188,11 @@ class ReActAgent:
 
         # 如果清理后 Token 已经降回安全水位（预留 20% 安全余量），直接返回，避免 LLM 摘要
         if current_tokens < (self.max_context_token * 0.8):
-            return "llm_node"
+            return
 
         # 保护机制：系统提示词（0）、用户提问（1）和最近的两轮交互（最新4条消息）不能被压缩
         if len(messages) <= 6:
-            return "llm_node"
+            return
 
         keep_front = 2
         keep_back = 4
@@ -258,8 +234,35 @@ class ReActAgent:
         except Exception as e:
             self.callback_manager.trigger("on_error", f"摘要节点执行异常: {e}")
 
-        # 压缩完毕，流转回LLM节点继续主线任务
+    # ==========================================
+    # 路由规则 (Graph Edges)
+    # ==========================================
+    def _edge_check_memory(self, state: AgentState) -> str:
+        """条件路由：检查Token水位，决定去思考还是去压缩"""
+        current_tokens = self._calculate_message_tokens(state["messages"])
+        self.callback_manager.trigger(
+            "on_memory_check", current_tokens, self.max_context_token
+        )
+
+        if current_tokens > self.max_context_token:
+            return "summarize_node"
+
         return "llm_node"
+
+    def _edge_should_continue(self, state: AgentState) -> str:
+        """条件路由：根据大模型的输出，决定调用工具还是结束任务"""
+        last_msg = state["messages"][-1]
+
+        if getattr(last_msg, "tool_calls", None):
+            if state["step_count"] >= self.max_steps:
+                state["status"] = "max_steps_reached"
+                return "END"
+
+            return "tool_node"
+
+        state["status"] = "completed"
+        state["final_answer"] = getattr(last_msg, "content", "无文本输出")
+        return "END"
 
     # =============================
     # 引擎主干：状态机执行图（State Graph Runner）
@@ -277,16 +280,30 @@ class ReActAgent:
             "final_answer": "",
         }
 
-        current_node = "llm_node"
+        current_node = "START"
 
         # 状态机主循环：只负责路由流转，不处理具体业务逻辑
         while state["status"] == "running":
-            if current_node == "llm_node":
-                current_node = self._node_llm(state)
+            if current_node == "START":
+                current_node = self._edge_check_memory(state)
+            elif current_node == "llm_node":
+                self._node_llm(state)
+                if state["status"] == "running":
+                    current_node = self._edge_should_continue(state)
+                else:
+                    current_node = "END"
             elif current_node == "tool_node":
-                current_node = self._node_tool(state)
+                self._node_tool(state)
+                if state["status"] == "running":
+                    current_node = "START"
+                else:
+                    current_node = "END"
             elif current_node == "summarize_node":
-                current_node = self._node_compress_context(state)
+                self._node_compress_context(state)
+                if state["status"] == "running":
+                    current_node = "llm_node"
+                else:
+                    current_node = "END"
             elif current_node == "END":
                 break
 
