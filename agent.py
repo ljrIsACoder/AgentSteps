@@ -607,6 +607,89 @@ def run_terminal_command(command: str) -> str:
     return "执行成功" if run_result.returncode == 0 else run_result.stderr
 
 
+class SearchWorkspaceArgs(BaseModel):
+    search_dir: str = Field(
+        ...,
+        description="要搜索的目录的绝对路径（通常使用环境信息中提供的当前目标工作目录）",
+    )
+    keyword: str = Field(
+        ..., description="要搜索的关键字符串或正则表达式（如类名、函数名或特定文本）"
+    )
+    include_ignored: bool = Field(
+        False,
+        description="是否在 .gitignore 忽略的文件和隐藏文件（如 .env）中搜索。如果常规搜索未找到，或明确需要查找配置/编译产物，请设为 True。",
+    )
+
+
+@tool(args_schema=SearchWorkspaceArgs)
+def search_workspace(
+    search_dir: str, keyword: str, include_ignored: bool = False
+) -> str:
+    """
+    在整个项目目录中进行全局文本搜索，快速定位特定的代码定义或文本片段所在的具体文件和行号。
+    当不知道目标代码在哪个文件时，必须优先调用此工具
+    """
+    import os
+    import subprocess
+
+    if not os.path.exists(search_dir):
+        return f"错误：目录{search_dir} 不存在"
+
+    try:
+        # 优先尝试使用 rg (ripgrep), 速度极快，且默认会忽略.git 和 .gitignore 中配置的目录 （如 node_modules）
+        cmd = ["rg", "-n", "-C", "1", keyword, search_dir]
+
+        if include_ignored:
+            cmd.extend(
+                [
+                    "--no-ignore",  # 无视 .gitignore
+                    "--hidden",  # 包含隐藏文件 (如 .env, .github)
+                    "-g",
+                    "!node_modules/**",  # [安全兜底] 无论如何绝对不搜 node_modules
+                    "-g",
+                    "!.git/**",  # [安全兜底] 无论如何绝对不搜 .git
+                    "-g",
+                    "!.venv/**",  # [安全兜底] 无论如何绝对不搜 Python 虚拟环境
+                ]
+            )
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        output = result.stdout
+    except FileNotFoundError:
+        try:
+            # 如果没有安装 rg，降级使用原生 grep (macOS/Linux 标配)
+            # 手动排除常见的干扰目录，防止大项目把 Token 撑爆
+            cmd = [
+                "grep",
+                "-rnC",
+                "1",
+                "--exclude-dir=.git",
+                "--exclude-dir=node_modules",
+                "--exclude-dir=dist",
+                "exclude-dir=.venv",
+                keyword,
+                search_dir,
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            output = result.stdout
+        except FileNotFoundError:
+            return "错误：系统中未安装 ripgrep (rg) 或 grep。请在宿主机安装 ripgrep 以启用全局搜索。"
+
+    if result.returncode == 0 and output.strip():
+        max_length = 2500
+        if len(output) > max_length:
+            return (
+                output[:max_length]
+                + "\n\n...[匹配结果过多，已截断，请尝试给大模型传入更精确的 keyword]..."
+            )
+        return output
+    elif result.returncode == 1:
+        return f"全局搜索完成：未在 {search_dir} 中找到与 '{keyword}' 匹配的结果。请尝试其他关键字。"
+    else:
+        return f"搜索命令执行异常：{result.stderr}"
+
+
 @click.command()
 @click.argument(
     "project_directory", type=click.Path(exists=False, file_okay=False, dir_okay=True)
@@ -634,6 +717,7 @@ def main(project_directory):
         run_terminal_command,
         get_outline_with_treesitter,
         search_in_file_fuzzy,
+        search_workspace,
     ]
 
     console_hanlder = ConsoleCallbackHandler()
