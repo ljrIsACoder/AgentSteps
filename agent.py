@@ -27,6 +27,7 @@ class AgentState(TypedDict):
     step_count: int
     status: Literal["running", "completed", "cancelled", "max_steps_reached", "error"]
     final_answer: str
+    plan: str
 
 
 class ReActAgent:
@@ -235,6 +236,47 @@ class ReActAgent:
             self.callback_manager.trigger("on_error", f"摘要节点执行异常: {e}")
 
     # ==========================================
+    # 计划节点 (Graph Nodes)
+    # ==========================================
+    def _node_planner(self, state: AgentState) -> None:
+        """规划者节点：负责将宏大的用户需求拆解为可执行的步骤清单"""
+        self.callback_manager.trigger("on_llm_start")
+
+        # 提取用户的原始需求
+        user_input = state["messages"][1].content
+
+        planner_prompt = f"""
+            你是一个资深的软件架构师（Planner）。你的任务是将用户的开发需求拆解为逻辑严密的逐步执行计划。
+            请使用 Markdown 的 CheckList 格式输出计划（如：- [ ] 步骤一：...）。
+            尽量将“全局探索(找文件)”、“大纲阅读”、“局部修改”、“完整测试”分离为不同步骤。
+            不要输出任何多余的废话，只输出一份精炼的计划清单。
+        
+            用户需求：{user_input}
+        """
+
+        try:
+            # 独立发起一次快速的模型调用来生成计划
+            ai_msg = self.llm.invoke(messages=[HumanMessage(content=planner_prompt)])
+            state["plan"] = ai_msg.content
+
+            # 借用现有的 thought 钩子，将计划打印到终端，方便人类监督
+            self.callback_manager.trigger(
+                "on_llm_thought", f"【Planner 架构师已生成全局计划】\n{state['plan']}"
+            )
+
+            # 将计划作为不可篡改的系统指令，强行塞入Worder的脑海中
+            plan_injection = SystemMessage(
+                content=f"📋 架构师分配的全局计划：\n{state['plan']}\n\n"
+                "请作为执行者（Worker），严格按照上述计划的顺序逐步执行工具。在每次思考（<thought>）时，必须先声明当前正在执行计划的哪一步，并自行核对进度。"
+            )
+            # 插入到原来SystemMessage和HumanMessage的中间
+            state["messages"].insert(1, plan_injection)
+
+        except Exception as e:
+            self.callback_manager.trigger("on_error", f"Planner 节点生成计划异常: {e}")
+            state["status"] = "error"
+
+    # ==========================================
     # 路由规则 (Graph Edges)
     # ==========================================
     def _edge_check_memory(self, state: AgentState) -> str:
@@ -278,6 +320,7 @@ class ReActAgent:
             "step_count": 0,
             "status": "running",
             "final_answer": "",
+            "plan": "",
         }
 
         current_node = "START"
@@ -285,25 +328,39 @@ class ReActAgent:
         # 状态机主循环：只负责路由流转，不处理具体业务逻辑
         while state["status"] == "running":
             if current_node == "START":
-                current_node = self._edge_check_memory(state)
+                if not state["plan"]:
+                    current_node = "planner_node"
+                else:
+                    current_node = self._edge_check_memory(state)
+
+            elif current_node == "planner_node":
+                self._node_planner(state)
+                if state["status"] == "running":
+                    current_node = "llm_node"
+                else:
+                    current_node = "END"
+
             elif current_node == "llm_node":
                 self._node_llm(state)
                 if state["status"] == "running":
                     current_node = self._edge_should_continue(state)
                 else:
                     current_node = "END"
+
             elif current_node == "tool_node":
                 self._node_tool(state)
                 if state["status"] == "running":
                     current_node = "START"
                 else:
                     current_node = "END"
+
             elif current_node == "summarize_node":
                 self._node_compress_context(state)
                 if state["status"] == "running":
                     current_node = "llm_node"
                 else:
                     current_node = "END"
+
             elif current_node == "END":
                 break
 
