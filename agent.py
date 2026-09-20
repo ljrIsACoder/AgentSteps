@@ -414,6 +414,57 @@ def write_to_file(file_path: str, content: str) -> str:
     return "写入成功"
 
 
+class EditFileArgs(BaseModel):
+    file_path: str = Field(..., description="要修改的文件的绝对路径")
+    search_block: str = Field(
+        ...,
+        description="需要被替换的旧代码块。必须与文件中的原始内容完全一致（包括空格、缩进和空行）。",
+    )
+    replace_block: str = Field(..., description="用于替换的新代码块。")
+
+
+@tool(args_schema=EditFileArgs)
+def edit_file(file_path: str, seach_block: str, replace_block: str) -> str:
+    """
+    通过精准的文本替换来修改现有文件（外壳手术式编辑）。
+    当你只需要修改文件中的某几个函数或某几行代码时，必须使用此工具，绝对禁止使用write_to_file全量覆盖。
+    """
+
+    if not os.path.exists(file_path):
+        return f"错误：文件 {file_path} 不存在。如果你想创建新文件，请使用 write_to_file 工具。"
+
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # 尝试精确定位
+        if seach_block not in content:
+            # 常见错误：大模型可能漏掉了缩进或多加了空行，提供友好的错误排查提示
+            return (
+                "错误：未在文件中找到完全匹配的 search_block。\n"
+                "【排查建议】\n"
+                "1. 请确保 search_block 包含了目标行前后的完整缩进（空格或 Tab）。\n"
+                "2. 确保没有多余或遗漏的空行。\n"
+                "3. 建议先使用 read_file 准确读取目标行，复制原文作为 search_block。"
+            )
+
+        # 统计出现次数，防止误替换多处相同代码
+        occurrences = content.count(seach_block)
+        if occurrences > 1:
+            return f"错误：search_block 在文件中出现了 {occurrences} 次，无法确定要替换哪一处。请在 search_block 中包含更多的上下文代码以确保唯一性。"
+
+        # 执行替换
+        new_content = content.replace(seach_block, replace_block)
+
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+
+        return f"成功：已精准修改文件 {file_path}"
+
+    except Exception as e:
+        return f"编辑失败：{str(e)}"
+
+
 def _process_node(
     node: Any,
     capture_name: str,
@@ -718,6 +769,7 @@ def main(project_directory):
         get_outline_with_treesitter,
         search_in_file_fuzzy,
         search_workspace,
+        edit_file,
     ]
 
     console_hanlder = ConsoleCallbackHandler()
