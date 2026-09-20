@@ -1,39 +1,51 @@
 import json
+from abc import abstractmethod
 
 
 class BaseCallbackHandler:
     """事件钩子基类：定义 Agent 生命周期中的所有可监听事件"""
 
+    @abstractmethod
     def on_step_start(self, *args, **kwargs):
         pass
 
+    @abstractmethod
     def on_llm_start(self):
         pass
 
+    @abstractmethod
     def on_llm_thought(self, *args, **kwargs):
         pass
 
+    @abstractmethod
     def on_tool_start(self, *args, **kwargs):
         pass
 
+    @abstractmethod
     def on_tool_confirm(self, *args, **kwargs) -> bool:
         return True
 
+    @abstractmethod
     def on_tool_end(self, *args, **kwargs):
         pass
 
+    @abstractmethod
     def on_memory_check(self, *args, **kwargs):
         pass
 
+    @abstractmethod
     def on_memory_evict(self, *args, **kwargs):
         pass
 
+    @abstractmethod
     def on_memory_summarize(self, *args, **kwargs):
         pass
 
+    @abstractmethod
     def on_agent_finish(self, *args, **kwargs):
         pass
 
+    @abstractmethod
     def on_error(self, *args, **kwargs):
         pass
 
