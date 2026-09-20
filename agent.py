@@ -1,7 +1,6 @@
 import os
 import re
 import json
-import click
 import inspect
 import tiktoken
 import platform
@@ -9,11 +8,11 @@ from string import Template
 from dotenv import load_dotenv
 from prompt_toolkit import prompt
 from pydantic import BaseModel, Field
-from llm import BaseChatModel, ChatOpenAI
+from llm import BaseChatModel
 from prompt_template import react_system_prompt_template
 from tree_sitter import Parser, Language, Query, QueryCursor
 from typing import Any, List, Callable, TypedDict, Literal
-from event_center import BaseCallbackHandler, CallbackManager, ConsoleCallbackHandler
+from event_center import BaseCallbackHandler, CallbackManager
 
 from lanuage_config import LANGUAGE_CONFIGS
 from utils import generate_tool_schema, tool
@@ -165,7 +164,7 @@ class ReActAgent:
         protect_tail_index = max(0, len(messages) - (preserve_recent_rounds * 2))
         freed_chars = 0
 
-        for i in range(2, protect_tail_index):  # 跳过 System(0) 和 User(1)
+        for i in range(3, protect_tail_index):  # 跳过 System(0) 和 User(1)
             msg = messages[i]
             if isinstance(msg, ToolMessage):
                 # 如果内容超过 150 字符，判定为可被淘汰的冗长历史数据
@@ -192,10 +191,10 @@ class ReActAgent:
             return
 
         # 保护机制：系统提示词（0）、用户提问（1）和最近的两轮交互（最新4条消息）不能被压缩
-        if len(messages) <= 6:
+        if len(messages) <= 7:
             return
 
-        keep_front = 2
+        keep_front = 3
         keep_back = 4
         # 提取中间需要被压缩的冗长历史
         history_to_compress = messages[keep_front:-keep_back]
@@ -796,55 +795,3 @@ def search_workspace(
         return f"全局搜索完成：未在 {search_dir} 中找到与 '{keyword}' 匹配的结果。请尝试其他关键字。"
     else:
         return f"搜索命令执行异常：{result.stderr}"
-
-
-@click.command()
-@click.argument(
-    "project_directory", type=click.Path(exists=False, file_okay=False, dir_okay=True)
-)
-def main(project_directory):
-    project_dir = os.path.abspath(project_directory)
-    if not os.path.exists(project_dir):
-        should_create = prompt(f"目录 '{project_dir}' 不存在，是否创建？（Y/N): ")
-        if should_create.lower() == "y":
-            os.makedirs(project_dir)
-            print(f"✅ 成功创建目录: {project_dir}")
-        else:
-            print("❌ 操作已取消，请提供一个存在的目录。")
-            return
-
-    llm = ChatOpenAI(
-        model_name="deepseek/deepseek-v4.1-flash",
-        api_key=ReActAgent.get_api_key(),
-        base_url="https://openrouter.ai/api/v1",
-    )
-
-    tools = [
-        read_file,
-        write_to_file,
-        run_terminal_command,
-        get_outline_with_treesitter,
-        search_in_file_fuzzy,
-        search_workspace,
-        edit_file,
-    ]
-
-    console_hanlder = ConsoleCallbackHandler()
-
-    agent = ReActAgent(
-        llm=llm,
-        tools=tools,
-        project_directory=project_dir,
-        max_steps=30,
-        callbacks=[console_hanlder],
-    )
-
-    task = prompt("请输入任务：")
-
-    final_answer = agent.run(task)
-
-    print(f"\n\n✅ Final Answer：{final_answer}")
-
-
-if __name__ == "__main__":
-    main()
