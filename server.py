@@ -78,6 +78,7 @@ class WebSocketCallbackHandler(BaseCallbackHandler):
         self._send("error", {"message": error})
 
 
+@app.websocket("/ws/agent")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     loop = asyncio.get_running_loop()
