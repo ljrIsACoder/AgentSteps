@@ -32,7 +32,7 @@ class ChatOpenAI(BaseChatModel):
         self,
         model_name: str,
         api_key: str,
-        base_url: str = "https://api.openai.com/v1",
+        base_url: str = "https://openrouter.ai/api/v1",
         max_retries: int = 3,
         timeout_seconds: float = 60.0,
     ):
