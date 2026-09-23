@@ -1,440 +1,192 @@
 import os
 import re
-import json
-import inspect
-import tiktoken
 import platform
 from string import Template
-from dotenv import load_dotenv
-from prompt_toolkit import prompt
-from pydantic import BaseModel, Field
-from llm import BaseChatModel
-from prompt_template import react_system_prompt_template
 from tree_sitter import Parser, Language, Query, QueryCursor
-from typing import Any, List, Callable, TypedDict, Literal
-from event_center import BaseCallbackHandler, CallbackManager
+from typing import Any, TypedDict, Annotated
+
+from langchain_core.tools import tool
+from langgraph.graph import StateGraph, START, END
+from langchain_core.messages import (
+    BaseMessage,
+    AIMessage,
+    ToolMessage,
+    SystemMessage,
+    HumanMessage,
+    RemoveMessage,
+)
+from langgraph.graph.message import add_messages
+from langchain_core.runnables import RunnableConfig
 
 from lanuage_config import LANGUAGE_CONFIGS
-from utils import generate_tool_schema, tool
-from message import BaseMessage, AIMessage, ToolMessage, SystemMessage, HumanMessage
+from prompt_template import react_system_prompt_template
 
 
 # 全局状态（State）的数据结构
 # 所有的上下文、计数器和执行状态都集中在这里，节点只负责读取和更新这个状态
 class AgentState(TypedDict):
-    messages: list[BaseMessage]
+    messages: Annotated[list[BaseMessage], add_messages]
     step_count: int
-    status: Literal["running", "completed", "cancelled", "max_steps_reached", "error"]
-    final_answer: str
     plan: str
 
 
-class ReActAgent:
-    def __init__(
-        self,
-        llm: BaseChatModel,
-        tools: List[Callable],
-        project_directory: str,
-        max_steps: int = 15,
-        max_context_token: int = 32000,
-        callbacks: list[BaseCallbackHandler] | None = None,
-    ):
-        self.llm = llm
-        self.tools = {func.__name__: func for func in tools}
-        self.tool_schemas: list[Any] = [generate_tool_schema(func) for func in tools]
-        self.max_steps = max_steps
-        self.max_context_token = max_context_token
-        self.project_directory = project_directory
-        self.callback_manager = CallbackManager(callbacks or [])
+def planner_node(state: AgentState, config: RunnableConfig) -> dict:
+    """规划节点"""
+    if state.get("plan"):
+        return {}
 
-        # 初始化tonkenizer (使用OpenAI通用的cl100k_base 近似估算)
+    configurable = config.get("configurable", {})
+    llm = configurable.get("llm")
+
+    if not llm:
+        raise ValueError("Config 字典中缺少 llm 实例，请检查 build_graph 的依赖注入")
+
+    user_input = state["messages"][0].content
+    prompt = f"作为架构师，请用 Markdown CheckList 拆解任务。任务：{user_input}"
+
+    ai_msg = llm.invoke([HumanMessage(content=prompt)], config=config)
+
+    return {"plan": ai_msg.content}
+
+
+def worker_node(state: AgentState, config: RunnableConfig) -> dict:
+    """执行节点：动态拼装 Prompt"""
+    configurable = config.get("configurable", {})
+    llm_with_tools = configurable.get("llm_with_tools")
+    proj_dir = configurable.get("project_dir")
+    tools_list = configurable.get("tools_list")
+
+    if not llm_with_tools:
+        raise ValueError("Config 字典中缺少llm_with_tools")
+
+    if not proj_dir or not tools_list:
+        raise ValueError("Config 字典中缺少 project_dir 或者 tools_list 配置")
+
+    sys_prompt = Template(react_system_prompt_template).substitute(
+        operating_system=platform.system(),
+        tool_list="\n".join([f"- {t.name}: {t.description}" for t in tools_list]),
+        file_list=", ".join(os.listdir(proj_dir)) if os.listdir(proj_dir) else "空目录",
+        project_directory=proj_dir,
+    )
+
+    if state.get("plan"):
+        sys_prompt += f"\n\n📋 全局计划：\n{state['plan']}\n请在 <thought> 中声明进度。"
+
+    messages = [SystemMessage(content=sys_prompt)] + state["messages"]
+
+    ai_msg = llm_with_tools.invoke(messages, config=config)
+
+    return {"messages": [ai_msg], "step_count": state.get("step_count", 0) + 1}
+
+
+def tool_node(state: AgentState, config: RunnableConfig) -> dict:
+    """工具执行节点"""
+    configurable = config.get("configurable", {})
+    tools_map = configurable.get("tools_map")
+    last_msg = state["messages"][-1]
+    tool_msgs = []
+
+    if not tools_map:
+        raise ValueError("Config 字典中缺少tools_map")
+
+    for tc in getattr(last_msg, "tool_calls", []):
+        tool_name, tool_args, tool_id = tc["name"], tc["args"], tc["id"]
+
         try:
-            self.encoding = tiktoken.get_encoding("cl100k_base")
-        except Exception:
-            self.encoding = None
-
-    def _count_tokens(self, text: str) -> int:
-        """粗略估算字符串的token数量"""
-        if not text:
-            return 0
-        if self.encoding:
-            return len(self.encoding.encode(text))
-
-        return len(text) // 2
-
-    def _calculate_message_tokens(self, messages: list[BaseMessage]) -> int:
-        """计算当前完整对话的token消耗"""
-        total = 0
-
-        for msg in messages:
-            content = msg.content
-            if isinstance(msg, AIMessage) and msg.tool_calls:
-                content += str(msg.tool_calls)
-
-            total += self._count_tokens(content)
-        return total
-
-    # =============================
-    # 节点 1: 大模型思考节点（LLM Node）
-    # 负责读取当前状态，请求模型，并决定下一步去向
-    # =============================
-    def _node_llm(self, state: AgentState) -> None:
-        state["step_count"] += 1
-        self.callback_manager.trigger(
-            "on_step_start", state["step_count"], self.max_steps
-        )
-
-        self.callback_manager.trigger("on_llm_start")
-        try:
-            ai_msg = self.llm.invoke(
-                messages=state["messages"], tools=self.tool_schemas
-            )
-
-            state["messages"].append(ai_msg)
-
-            if ai_msg.content:
-                self.callback_manager.trigger("on_llm_thought", ai_msg.content)
-
+            raw_obs = str(tools_map[tool_name].invoke(tool_args, config=config))
+            obs = raw_obs[:1000] + "\n...[截断]" if len(raw_obs) > 2000 else raw_obs
         except Exception as e:
-            self.callback_manager.trigger("on_error", f"模型请求失败: {str(e)}")
-            state["status"] = "error"
-            state["final_answer"] = f"模型请求失败: {str(e)}"
+            obs = f"执行错误：{str(e)}"
 
-    # =============================
-    # 节点 2: 工具执行节点（Tool Node）
-    # 负责解析大模型的工具请求，执行本地代码，并将结果写回状态
-    # =============================
-    def _node_tool(self, state: AgentState) -> None:
-        # 获取最新的一条消息（必定包含tool_calls）
-        last_message = state["messages"][-1]
+        tool_msgs.append(ToolMessage(content=obs, tool_call_id=tool_id, name=tool_name))
 
-        for tool_call in getattr(last_message, "tool_calls", []):
-            tool_name = tool_call["function"]["name"]
-            try:
-                tool_args = json.loads(tool_call["function"]["arguments"])
-            except json.JSONDecodeError:
-                tool_args = {}
+    return {"messages": tool_msgs}
 
-            self.callback_manager.trigger("on_tool_start", tool_name, tool_args)
 
-            # 终端命令安全拦截
-            if tool_name == "run_terminal_command":
-                should_continue = prompt("\n是否继续执行终端命令？（Y/N）: ")
-                if should_continue.lower() != "y":
-                    print("\n\n操作已取消。")
-                    state["status"] = "cancelled"
-                    return
+def compress_node(state: AgentState, config: RunnableConfig) -> dict:
+    """记忆压缩节点： 使用RemoveMessage销毁历史"""
+    messages = state["messages"]
+    configurable = config.get("configurable", {})
+    llm = configurable.get("llm")
 
-            # 执行工具
-            try:
-                raw_observation = str(self.tools[tool_name](**tool_args))
-                max_obs_length = 2000
+    if not llm:
+        raise ValueError("Config 字典中缺少 llm 实例，请检查 build_graph 的依赖注入")
 
-                # 结果截断处理
-                if len(raw_observation) > max_obs_length:
-                    half = max_obs_length // 2
-                    observation = (
-                        raw_observation[:half]
-                        + f"\n\n...[截断 {len(raw_observation) - max_obs_length} 字]...\n\n"
-                        + raw_observation[-half:]
-                    )
-                else:
-                    observation = raw_observation
-            except Exception as e:
-                observation = f"工具执行错误：{str(e)}"
-
-            self.callback_manager.trigger("on_tool_end", tool_name, observation)
-
-            # 将执行结果存入状态
-            state["messages"].append(
+    updates = []
+    protext_tail = max(0, len(messages) - 6)
+    for i in range(1, protext_tail):
+        msg = messages[i]
+        if isinstance(msg, ToolMessage) and len(str(msg.content)) > 150:
+            updates.append(
                 ToolMessage(
-                    content=observation, tool_call_id=tool_call["id"], name=tool_name
+                    content=f"[历史数据已回收。工具：{msg.name}]",
+                    tool_call_id=msg.tool_call_id,
+                    name=msg.name,
+                    id=msg.id,
                 )
             )
 
-    def _evict_old_tool_outputs(
-        self, messages: list[Any], preserve_recent_rounds: int = 3
-    ) -> int:
-        """
-        就地清空早期历史中 role="tool" 的冗长 content，保留最近的 N 轮完整交互。
-        返回释放后节省的大致 Token 数量。
-        """
-        # 每轮标准交互通常包含: Assistant(tool_call) + Tool(observation)
-        # 保留最近 preserve_recent_rounds 轮即大约保留最后 6~8 条记录
-        protect_tail_index = max(0, len(messages) - (preserve_recent_rounds * 2))
-        freed_chars = 0
+    if len(messages) < 6:
+        return {"messages": updates} if updates else {}
 
-        for i in range(3, protect_tail_index):  # 跳过 System(0) 和 User(1)
-            msg = messages[i]
-            if isinstance(msg, ToolMessage):
-                # 如果内容超过 150 字符，判定为可被淘汰的冗长历史数据
-                if len(msg.content) > 150:
-                    freed_chars += len(msg.content)
-                    msg.content = f"[该工具执行历史数据已于前期使用完毕，为节约上下文已被自动回收。工具名: {msg.name}"
+    history_to_compress = messages[1:-4]
+    history_text = "".join([f"[{m.type}]: {m.content}\n" for m in history_to_compress])
 
-        return freed_chars // 2  # 粗略换算释放的 token
+    ai_msg = llm.invoke([HumanMessage(content=f"提炼核心结论：\n{history_text}")])
 
-    # =============================
-    # 节点 3: 摘要压缩节点
-    # =============================
-    def _node_compress_context(self, state: AgentState) -> None:
-        messages = state["messages"]
+    delete_msgs = [RemoveMessage(id=m.id) for m in history_to_compress if m.id]
+    summary_msg = AIMessage(content=f"📋 历史摘要:\n{ai_msg.content}")
 
-        # 第一阶段：尝试轻量级工具输出驱逐（0 延迟、0 费用）
-        freed_tokens = self._evict_old_tool_outputs(messages, preserve_recent_rounds=3)
-        if freed_tokens > 0:
-            self.callback_manager.trigger("on_memory_evict", freed_tokens)
-        current_tokens = self._calculate_message_tokens(messages)
-
-        # 如果清理后 Token 已经降回安全水位（预留 20% 安全余量），直接返回，避免 LLM 摘要
-        if current_tokens < (self.max_context_token * 0.8):
-            return
-
-        # 保护机制：系统提示词（0）、用户提问（1）和最近的两轮交互（最新4条消息）不能被压缩
-        if len(messages) <= 7:
-            return
-
-        keep_front = 3
-        keep_back = 4
-        # 提取中间需要被压缩的冗长历史
-        history_to_compress = messages[keep_front:-keep_back]
-
-        # 拼接这些历史消息用于大模型阅读
-        history_text = "".join(
-            [f"[{m.role}]: {m.content}\n" for m in history_to_compress]
-        )
-
-        # 发起一次独立的大模型调用，让其自己总结自己
-        summary_prompt = (
-            "你是一个记忆压缩助手。请将以下代码Agent的执行历史总结为一段精炼的笔记。\n"
-            "要求：\n"
-            "1. 提取所有已明确的结论（如文件位置、函数名、已发现的错误等）。\n"
-            "2. 忽略具体的长代码返回，保留核心路径和行动目的。\n"
-            "3. 语气保持客观，如：'已在 auth.js 中定位到 login 函数，未发现验证码逻辑。'\n\n"
-            f"--- 历史记录 ---\n{history_text}"
-        )
-
-        try:
-            summary_msg = HumanMessage(content=summary_prompt)
-            ai_msg = self.llm.invoke(messages=[summary_msg])
-
-            summary = ai_msg.content
-
-            if summary:
-                self.callback_manager.trigger("on_memory_summarize", summary)
-            # 用总结后的单条消息，替换掉中间的冗长记录
-            compressed_message = SystemMessage(
-                content=f"📋 早期执行历史摘要:\n{summary}"
-            )
-
-            state["messages"] = (
-                messages[:keep_front] + [compressed_message] + messages[-keep_back:]
-            )
-
-        except Exception as e:
-            self.callback_manager.trigger("on_error", f"摘要节点执行异常: {e}")
-
-    # ==========================================
-    # 计划节点 (Graph Nodes)
-    # ==========================================
-    def _node_planner(self, state: AgentState) -> None:
-        """规划者节点：负责将宏大的用户需求拆解为可执行的步骤清单"""
-        self.callback_manager.trigger("on_llm_start")
-
-        # 提取用户的原始需求
-        user_input = state["messages"][1].content
-
-        planner_prompt = f"""
-            你是一个资深的软件架构师（Planner）。你的任务是将用户的开发需求拆解为逻辑严密的逐步执行计划。
-            请使用 Markdown 的 CheckList 格式输出计划（如：- [ ] 步骤一：...）。
-            尽量将“全局探索(找文件)”、“大纲阅读”、“局部修改”、“完整测试”分离为不同步骤。
-            不要输出任何多余的废话，只输出一份精炼的计划清单。
-        
-            用户需求：{user_input}
-        """
-
-        try:
-            # 独立发起一次快速的模型调用来生成计划
-            ai_msg = self.llm.invoke(messages=[HumanMessage(content=planner_prompt)])
-            state["plan"] = ai_msg.content
-
-            # 借用现有的 thought 钩子，将计划打印到终端，方便人类监督
-            self.callback_manager.trigger(
-                "on_llm_thought", f"【Planner 架构师已生成全局计划】\n{state['plan']}"
-            )
-
-            # 将计划作为不可篡改的系统指令，强行塞入Worder的脑海中
-            plan_injection = SystemMessage(
-                content=f"📋 架构师分配的全局计划：\n{state['plan']}\n\n"
-                "请作为执行者（Worker），严格按照上述计划的顺序逐步执行工具。在每次思考（<thought>）时，必须先声明当前正在执行计划的哪一步，并自行核对进度。"
-            )
-            # 插入到原来SystemMessage和HumanMessage的中间
-            state["messages"].insert(1, plan_injection)
-
-        except Exception as e:
-            self.callback_manager.trigger("on_error", f"Planner 节点生成计划异常: {e}")
-            state["status"] = "error"
-
-    # ==========================================
-    # 路由规则 (Graph Edges)
-    # ==========================================
-    def _edge_check_memory(self, state: AgentState) -> str:
-        """条件路由：检查Token水位，决定去思考还是去压缩"""
-        current_tokens = self._calculate_message_tokens(state["messages"])
-        self.callback_manager.trigger(
-            "on_memory_check", current_tokens, self.max_context_token
-        )
-
-        if current_tokens > self.max_context_token:
-            return "summarize_node"
-
-        return "llm_node"
-
-    def _edge_should_continue(self, state: AgentState) -> str:
-        """条件路由：根据大模型的输出，决定调用工具还是结束任务"""
-        last_msg = state["messages"][-1]
-
-        if getattr(last_msg, "tool_calls", None):
-            if state["step_count"] >= self.max_steps:
-                state["status"] = "max_steps_reached"
-                return "END"
-
-            return "tool_node"
-
-        state["status"] = "completed"
-        state["final_answer"] = getattr(last_msg, "content", "无文本输出")
-        return "END"
-
-    # =============================
-    # 引擎主干：状态机执行图（State Graph Runner）
-    # =============================
-    def run(self, user_input: str):
-        state: AgentState = {
-            "messages": [
-                SystemMessage(
-                    content=self.render_system_prompt(react_system_prompt_template)
-                ),
-                HumanMessage(content=user_input),
-            ],
-            "step_count": 0,
-            "status": "running",
-            "final_answer": "",
-            "plan": "",
-        }
-
-        current_node = "START"
-
-        # 状态机主循环：只负责路由流转，不处理具体业务逻辑
-        while state["status"] == "running":
-            if current_node == "START":
-                if not state["plan"]:
-                    current_node = "planner_node"
-                else:
-                    current_node = self._edge_check_memory(state)
-
-            elif current_node == "planner_node":
-                self._node_planner(state)
-                if state["status"] == "running":
-                    current_node = "llm_node"
-                else:
-                    current_node = "END"
-
-            elif current_node == "llm_node":
-                self._node_llm(state)
-                if state["status"] == "running":
-                    current_node = self._edge_should_continue(state)
-                else:
-                    current_node = "END"
-
-            elif current_node == "tool_node":
-                self._node_tool(state)
-                if state["status"] == "running":
-                    current_node = "START"
-                else:
-                    current_node = "END"
-
-            elif current_node == "summarize_node":
-                self._node_compress_context(state)
-                if state["status"] == "running":
-                    current_node = "llm_node"
-                else:
-                    current_node = "END"
-
-            elif current_node == "END":
-                break
-
-        # 根据最新状态返回结果
-        if state["status"] == "completed":
-            self.callback_manager.trigger("on_agent_finish", state["final_answer"])
-            return state["final_answer"]
-        elif state["status"] == "cancelled":
-            self.callback_manager.trigger("on_error", "操作被用户取消")
-            return "操作被用户取消"
-        elif state["status"] == "max_steps_reached":
-            self.callback_manager.trigger(
-                "on_error", "系统终止：任务因超过最大步数限制而未完成"
-            )
-            return "【系统终止】任务因超过最大步数限制而未完成"
-        else:
-            self.callback_manager.trigger(
-                "on_error", f"异常退出。状态: {state['status']}"
-            )
-            return f"【系统终止】发生异常退出。状态: {state['status']}"
-
-    def get_tool_list(self) -> str:
-        """生成工具列表字符串，包含函数签名和简要说明"""
-        tool_descriptions = []
-        for func in self.tools.values():
-            name = func.__name__
-            signature = str(inspect.signature(func))
-            doc = inspect.getdoc(func)
-            tool_descriptions.append(f"- {name}{signature}: {doc}")
-        return "\n".join(tool_descriptions)
-
-    def render_system_prompt(self, system_prompt_template: str) -> str:
-        """渲染系统提k示模板，替换变量"""
-        tool_list = self.get_tool_list()
-        files = os.listdir(self.project_directory)
-        if files:
-            file_list = ", ".join(
-                os.path.abspath(os.path.join(self.project_directory, f)) for f in files
-            )
-        else:
-            file_list = "该目录目前为空"
-
-        return Template(system_prompt_template).substitute(
-            operating_system=self.get_operating_system_name(),
-            tool_list=tool_list,
-            file_list=file_list,
-            project_directory=os.path.abspath(self.project_directory),
-        )
-
-    @staticmethod
-    def get_api_key() -> str:
-        """Load the API key from an environment variable."""
-        load_dotenv()
-        api_key = os.getenv("OPENROUTER_API_KEY")
-        if not api_key:
-            raise ValueError(
-                "未找到 OPENROUTER_API_KEY 环境变量，请在 .env 文件中设置。"
-            )
-        return api_key
-
-    def get_operating_system_name(self):
-        os_map = {"Darwin": "macOS", "Windows": "Windows", "Linux": "Linux"}
-
-        return os_map.get(platform.system(), "Unknown")
+    return {"messages": delete_msgs + [summary_msg]}
 
 
-class ReadFileArgs(BaseModel):
-    file_path: str = Field(..., description="要读取的文件的绝对路径")
-    start_line: int = Field(1, description="读取的起始行号，默认为1")
-    end_line: int | None = Field(
-        None, description="读取的结束行号，如果不指定则读取到文件末尾"
+def should_continue(state: AgentState) -> str:
+    if getattr(state["messages"][-1], "tool_calls", None):
+        return "tool_node" if state.get("step_count", 0) < 30 else END
+    return END
+
+
+def build_graph(llm, project_dir):
+    """对外暴露的工厂函数，用于组装并返回编译好的可执行图"""
+    tools_list = [
+        read_file,
+        write_to_file,
+        edit_file,
+        get_outline_with_treesitter,
+        search_in_file_fuzzy,
+        run_terminal_command,
+        search_workspace,
+    ]
+    llm_with_tools = llm.bind_tools(tools_list)
+    tools_map = {t.name: t for t in tools_list}
+
+    configurable = {
+        "llm": llm,
+        "llm_with_tools": llm_with_tools,
+        "tools_list": tools_list,
+        "tools_map": tools_map,
+        "project_dir": project_dir,
+    }
+
+    workflow = StateGraph(AgentState)
+
+    workflow.add_node("planner_node", planner_node)
+    workflow.add_node("worker_node", worker_node)
+    workflow.add_node("tool_node", tool_node)
+    workflow.add_node("compress_node", compress_node)
+
+    workflow.add_edge(START, "planner_node")
+    workflow.add_edge("planner_node", "worker_node")
+    workflow.add_conditional_edges(
+        "worker_node", should_continue, {"tool_node": "tool_node", END: END}
     )
+    workflow.add_edge("tool_node", "compress_node")
+    workflow.add_edge("compress_node", "worker_node")
+
+    return workflow.compile().with_config(configurable=configurable)
 
 
-@tool(args_schema=ReadFileArgs)
+@tool
 def read_file(file_path: str, start_line: int = 1, end_line: int | None = None) -> str:
     """读取文件的指定行数内容，如果不指定end_line，默认读取整个文件。如果文件过大，请尝试分段读取。"""
     try:
@@ -456,12 +208,7 @@ def read_file(file_path: str, start_line: int = 1, end_line: int | None = None) 
         return f"读取失败：{str(e)}"
 
 
-class WriteToFileArgs(BaseModel):
-    file_path: str = Field(..., description="要写入文件的绝对路径")
-    content: str = Field(..., description="要写入文件的完整文件内容")
-
-
-@tool(args_schema=WriteToFileArgs)
+@tool
 def write_to_file(file_path: str, content: str) -> str:
     """将指定内容写入指定文件"""
     print("file_path", file_path)
@@ -470,16 +217,7 @@ def write_to_file(file_path: str, content: str) -> str:
     return "写入成功"
 
 
-class EditFileArgs(BaseModel):
-    file_path: str = Field(..., description="要修改的文件的绝对路径")
-    search_block: str = Field(
-        ...,
-        description="需要被替换的旧代码块。必须与文件中的原始内容完全一致（包括空格、缩进和空行）。",
-    )
-    replace_block: str = Field(..., description="用于替换的新代码块。")
-
-
-@tool(args_schema=EditFileArgs)
+@tool
 def edit_file(file_path: str, seach_block: str, replace_block: str) -> str:
     """
     通过精准的文本替换来修改现有文件（外壳手术式编辑）。
@@ -565,11 +303,7 @@ def _process_node(
         outline_items.append((line_num, f"行 {line_num}: {node_type} {node_text}"))
 
 
-class GetOutlineArgs(BaseModel):
-    file_path: str = Field(..., description="目标代码文件的绝对路径")
-
-
-@tool(args_schema=GetOutlineArgs)
+@tool
 def get_outline_with_treesitter(file_path: str):
     """获取代码文件的大纲（提取类、函数、接口等定义），帮助快速了解文件全貌。使用工业级 Tree-sitter解析。"""
     if not os.path.exists(file_path):
@@ -658,14 +392,7 @@ def get_outline_with_treesitter(file_path: str):
         return f"获取大纲失败: {str(e)}"
 
 
-class SearchFuzzyArgs(BaseModel):
-    file_path: str = Field(..., description="要搜索文件的绝对路径")
-    keywords: list[str] = Field(
-        ..., description="要搜索的关键词列表，例如['login', 'auth']"
-    )
-
-
-@tool(args_schema=SearchFuzzyArgs)
+@tool
 def search_in_file_fuzzy(file_path: str, keywords: list[str]) -> str:
     """
     在指定文件夹中搜索多个可能得关键词（传入列表）, 只要命中任意一个关键词就会返回该行及其上下文。
@@ -701,11 +428,7 @@ def search_in_file_fuzzy(file_path: str, keywords: list[str]) -> str:
         return f"搜索失败：{str(e)}"
 
 
-class RunTerminalArgs(BaseModel):
-    command: str = Field(..., description="要执行的有效终端/Shell命令")
-
-
-@tool(args_schema=RunTerminalArgs)
+@tool
 def run_terminal_command(command: str) -> str:
     """用于执行终端命令"""
     import subprocess
@@ -714,21 +437,7 @@ def run_terminal_command(command: str) -> str:
     return "执行成功" if run_result.returncode == 0 else run_result.stderr
 
 
-class SearchWorkspaceArgs(BaseModel):
-    search_dir: str = Field(
-        ...,
-        description="要搜索的目录的绝对路径（通常使用环境信息中提供的当前目标工作目录）",
-    )
-    keyword: str = Field(
-        ..., description="要搜索的关键字符串或正则表达式（如类名、函数名或特定文本）"
-    )
-    include_ignored: bool = Field(
-        False,
-        description="是否在 .gitignore 忽略的文件和隐藏文件（如 .env）中搜索。如果常规搜索未找到，或明确需要查找配置/编译产物，请设为 True。",
-    )
-
-
-@tool(args_schema=SearchWorkspaceArgs)
+@tool
 def search_workspace(
     search_dir: str, keyword: str, include_ignored: bool = False
 ) -> str:

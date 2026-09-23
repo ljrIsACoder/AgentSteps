@@ -1,19 +1,11 @@
 import os
 import click
-from llm import ChatOpenAI
 from prompt_toolkit import prompt
-from event_center import ConsoleCallbackHandler
+from langchain_core.messages import HumanMessage
 
-from agent import (
-    ReActAgent,
-    read_file,
-    write_to_file,
-    edit_file,
-    run_terminal_command,
-    get_outline_with_treesitter,
-    search_in_file_fuzzy,
-    search_workspace,
-)
+from llm import get_chat_model
+from agent import build_graph, AgentState
+from event_center import ConsoleCallbackHandler
 
 
 @click.command()
@@ -31,35 +23,25 @@ def main(project_directory):
             print("❌ 操作已取消，请提供一个存在的目录。")
             return
 
-    llm = ChatOpenAI(
-        model_name="deepseek/deepseek-v4.1-flash",
-        api_key=ReActAgent.get_api_key(),
-        base_url="https://openrouter.ai/api/v1",
-    )
+    llm = get_chat_model()
 
-    tools = [
-        read_file,
-        write_to_file,
-        run_terminal_command,
-        get_outline_with_treesitter,
-        search_in_file_fuzzy,
-        search_workspace,
-        edit_file,
-    ]
+    app_graph = build_graph(llm, project_dir)
 
     console_hanlder = ConsoleCallbackHandler()
 
-    agent = ReActAgent(
-        llm=llm,
-        tools=tools,
-        project_directory=project_dir,
-        max_steps=30,
-        callbacks=[console_hanlder],
-    )
-
     task = prompt("请输入任务：")
 
-    final_answer = agent.run(task)
+    initial_state: AgentState = {
+        "messages": [HumanMessage(content=task)],
+        "step_count": 0,
+        "plan": "",
+    }
+
+    final_state = app_graph.invoke(
+        initial_state, config={"callbacks": [console_hanlder]}
+    )
+
+    final_answer = getattr(final_state["messages"][-1], "content", "无输出")
 
     print(f"\n\n✅ Final Answer：{final_answer}")
 
