@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import platform
 from string import Template
 from typing import TypedDict, Annotated
@@ -14,6 +15,7 @@ from langchain_core.messages import (
 )
 from langgraph.graph.message import add_messages
 from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.sqlite import SqliteSaver
 
 from tools import (
     read_file,
@@ -188,4 +190,9 @@ def build_graph(llm, project_dir):
     workflow.add_edge("tool_node", "compress_node")
     workflow.add_edge("compress_node", "worker_node")
 
-    return workflow.compile().with_config(configurable=configurable)
+    db_path = "checkpoints.db"
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+
+    memory = SqliteSaver(conn)
+
+    return workflow.compile(checkpointer=memory).with_config(configurable=configurable)

@@ -29,6 +29,10 @@ def main(project_directory):
 
     console_hanlder = ConsoleCallbackHandler()
 
+    base_configurable = (app_graph.config or {}).get("configurable", {})
+
+    merged_configurable = {**base_configurable, "thread_id": "test_session_001"}
+
     task = prompt("请输入任务：")
 
     initial_state: AgentState = {
@@ -38,7 +42,11 @@ def main(project_directory):
     }
 
     final_state = app_graph.invoke(
-        initial_state, config={"callbacks": [console_hanlder]}
+        initial_state,
+        config={
+            "configurable": merged_configurable,
+            "callbacks": [console_hanlder],
+        },
     )
 
     final_answer = getattr(final_state["messages"][-1], "content", "无输出")
